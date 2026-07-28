@@ -72,6 +72,18 @@ public final class DynamicNotch<Expanded, CompactLeading, CompactTrailing>: Obse
     /// Configuration for customizing transition animations and behavior.
     public var transitionConfiguration = DynamicNotchTransitionConfiguration()
 
+    /// Runtime-programmable shell colors, borders, padding, and corner radii.
+    @Published public var chrome: DynamicNotchChrome {
+        didSet {
+            if let presentedScreen {
+                updateScreenGeometry(for: presentedScreen)
+            }
+        }
+    }
+
+    /// Called whenever the rendered notch content gains or loses pointer hover.
+    public var onHoverChanged: ((Bool) -> Void)?
+
     /// Content
     let expandedContent: Expanded
     let compactLeadingContent: CompactLeading
@@ -83,10 +95,12 @@ public final class DynamicNotch<Expanded, CompactLeading, CompactTrailing>: Obse
     @Published private(set) var state: DynamicNotchState = .hidden
     @Published private(set) var notchSize: CGSize = .zero
     @Published private(set) var menubarHeight: CGFloat = 0
+    @Published private(set) var usesSyntheticNotch = false
     @Published public private(set) var isHovering: Bool = false
 
     private var closePanelTask: Task<(), Never>? // Used to close the panel after hiding completes
     private var screenParametersTask: Task<Void, Never>?
+    private var presentedScreen: NSScreen?
 
     /// Creates a new DynamicNotch with custom content and style.
     /// - Parameters:
@@ -98,12 +112,14 @@ public final class DynamicNotch<Expanded, CompactLeading, CompactTrailing>: Obse
     public init(
         hoverBehavior: DynamicNotchHoverBehavior = .all,
         style: DynamicNotchStyle = .auto,
+        chrome: DynamicNotchChrome = DynamicNotchChrome(),
         @ViewBuilder expanded: @escaping () -> Expanded,
         @ViewBuilder compactLeading: @escaping () -> CompactLeading = { EmptyView() },
         @ViewBuilder compactTrailing: @escaping () -> CompactTrailing = { EmptyView() }
     ) {
         self.hoverBehavior = hoverBehavior
         self.style = style
+        self.chrome = chrome
 
         self.expandedContent = expanded()
         self.compactLeadingContent = compactLeading()
@@ -125,11 +141,13 @@ public final class DynamicNotch<Expanded, CompactLeading, CompactTrailing>: Obse
     public convenience init(
         hoverBehavior: DynamicNotchHoverBehavior = [.keepVisible],
         style: DynamicNotchStyle = .auto,
+        chrome: DynamicNotchChrome = DynamicNotchChrome(),
         @ViewBuilder expanded: @escaping () -> Expanded
     ) where CompactLeading == EmptyView, CompactTrailing == EmptyView {
         self.init(
             hoverBehavior: hoverBehavior,
             style: style,
+            chrome: chrome,
             expanded: expanded,
             compactLeading: { EmptyView() },
             compactTrailing: { EmptyView() }
@@ -153,7 +171,11 @@ public final class DynamicNotch<Expanded, CompactLeading, CompactTrailing>: Obse
             let sequence = NotificationCenter.default.notifications(named: NSApplication.didChangeScreenParametersNotification)
             for await _ in sequence.map(\.name) {
                 guard !Task.isCancelled, let self else { return }
-                if let screen = NSScreen.screens.first {
+                guard state != .hidden else { continue }
+                if let screen = windowController?.window?.screen
+                    ?? presentedScreen
+                    ?? NSScreen.main
+                    ?? NSScreen.screens.first {
                     initializeWindow(screen: screen)
                 }
             }
@@ -167,6 +189,7 @@ public final class DynamicNotch<Expanded, CompactLeading, CompactTrailing>: Obse
         guard state != .hidden, hovering != isHovering else { return }
 
         isHovering = hovering
+        onHoverChanged?(hovering)
 
         if hoverBehavior.contains(.hapticFeedback) {
             let performer = NSHapticFeedbackManager.defaultPerformer
@@ -183,11 +206,11 @@ extension DynamicNotch {
     }
 
     func _expand(on screen: NSScreen = NSScreen.screens[0], skipHide: Bool) async {
-        guard state != .expanded else { return }
+        let needsNewWindow = state == .hidden
+            || windowController?.window?.screen != screen
+        guard state != .expanded || needsNewWindow else { return }
 
         closePanelTask?.cancel()
-
-        let needsNewWindow = state == .hidden || windowController?.window?.screen != screen
 
         if needsNewWindow {
             // Create window but don't show it yet
@@ -200,6 +223,10 @@ extension DynamicNotch {
 
             // Now show window with animation already in progress
             showWindow()
+        } else if skipHide {
+            withAnimation(effectiveConversionAnimation) {
+                self.state = .expanded
+            }
         } else {
             // Window exists and we're transitioning from compact state
             Task { @MainActor in
@@ -229,8 +256,6 @@ extension DynamicNotch {
     }
 
     func _compact(on screen: NSScreen = NSScreen.screens[0], skipHide: Bool) async {
-        guard state != .compact else { return }
-
         if effectiveStyle(for: screen).isFloating {
             await hide()
             return
@@ -241,10 +266,11 @@ extension DynamicNotch {
             return
         }
 
+        let needsNewWindow = state == .hidden
+            || windowController?.window?.screen != screen
+        guard state != .compact || needsNewWindow else { return }
+
         closePanelTask?.cancel()
-
-        let needsNewWindow = state == .hidden || windowController?.window?.screen != screen
-
         if needsNewWindow {
             // Create window but don't show it yet
             initializeWindow(screen: screen, orderFront: false)
@@ -256,6 +282,10 @@ extension DynamicNotch {
 
             // Now show window with animation already in progress
             showWindow()
+        } else if skipHide {
+            withAnimation(effectiveConversionAnimation) {
+                self.state = .compact
+            }
         } else {
             // Window exists and we're transitioning from expanded state
             Task { @MainActor in
@@ -359,8 +389,8 @@ private extension DynamicNotch {
         // so that we don't have a duplicate window
         deinitializeWindow()
 
-        notchSize = screen.notchFrameWithMenubarAsBackup.size
-        menubarHeight = screen.menubarHeight
+        presentedScreen = screen
+        updateScreenGeometry(for: screen)
 
         let style = effectiveStyle(for: screen)
         let view = NSHostingView(rootView: NotchContentView(dynamicNotch: self, style: style))
@@ -420,5 +450,14 @@ private extension DynamicNotch {
         guard let windowController else { return }
         windowController.close()
         self.windowController = nil
+    }
+
+    func updateScreenGeometry(for screen: NSScreen) {
+        let geometry = screen.dynamicNotchGeometry(
+            syntheticNotchWidth: chrome.syntheticNotchWidth
+        )
+        notchSize = geometry.notchFrame.size
+        menubarHeight = geometry.menuBarHeight
+        usesSyntheticNotch = !geometry.hasHardwareNotch
     }
 }
