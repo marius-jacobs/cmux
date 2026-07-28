@@ -1156,6 +1156,15 @@ impl BrowserSurface {
         }
     }
 
+    pub fn latest_frame_metadata(&self) -> Option<(u64, u32, u32)> {
+        let state = self.state.lock().unwrap();
+        if matches!(state.status, BrowserStatus::Failed(_)) {
+            None
+        } else {
+            state.latest_frame.as_ref().map(|frame| (frame.seq, frame.css_width, frame.css_height))
+        }
+    }
+
     pub fn has_latest_frame(&self) -> bool {
         let state = self.state.lock().unwrap();
         !matches!(state.status, BrowserStatus::Failed(_)) && state.latest_frame.is_some()
@@ -1262,6 +1271,10 @@ impl BrowserSurface {
     pub fn set_cell_pixel_size(&self, width_px: u16, height_px: u16) -> anyhow::Result<bool> {
         self.set_cell_pixel_size_reporting(width_px, height_px, Box::new(|_| {}))
             .map(|reservation_id| reservation_id.is_some())
+    }
+
+    pub(crate) fn cell_pixel_size(&self) -> (u16, u16) {
+        *self.cell_pixels.lock().unwrap()
     }
 
     pub fn set_cell_pixel_size_reporting(
@@ -2284,11 +2297,13 @@ mod tests {
         browser.store_frame(test_frame(2));
         assert_eq!(browser.status(), BrowserStatus::Failed("nope".into()));
         assert_eq!(browser.latest_frame(), None);
+        assert_eq!(browser.latest_frame_metadata(), None);
 
         // Clearing the error restores the retained frame.
         browser.clear_error();
         assert_eq!(browser.status(), BrowserStatus::Live);
         assert_eq!(browser.latest_frame().map(|frame| frame.seq), Some(2));
+        assert_eq!(browser.latest_frame_metadata(), Some((2, 80, 48)));
     }
 
     #[test]

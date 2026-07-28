@@ -27,6 +27,7 @@ use ghostty_vt::{KeyInput, MouseInput, RenderState, Terminal};
 use serde::Deserialize;
 use serde_json::json;
 
+pub(crate) use remote::read_json_line_with_progress;
 pub use remote::{
     RemoteMessageReader, RemoteMessageWriter, RemoteSession, RemoteSurface, RemoteTransport,
 };
@@ -1585,6 +1586,16 @@ impl SurfaceHandle {
         }
     }
 
+    pub fn browser_frame_metadata(&self) -> Option<(u64, u32, u32)> {
+        match self {
+            SurfaceHandle::Local(surface, _) => surface.browser_frame_metadata(),
+            SurfaceHandle::Remote(surface, _) if surface.kind == SurfaceKind::Browser => {
+                surface.browser_frame_metadata()
+            }
+            SurfaceHandle::Remote(_, _) | SurfaceHandle::RemoteBrowserUnsupported => None,
+        }
+    }
+
     pub fn has_browser_frame(&self) -> bool {
         match self {
             SurfaceHandle::Local(surface, _) => surface.has_browser_frame(),
@@ -1804,6 +1815,13 @@ pub(crate) fn test_remote_session_without_provider_authority() -> Session {
 #[cfg(test)]
 pub(crate) fn test_remote_session_with_provider_authority_without_guard() -> Session {
     Session::Remote(remote::test_session_with_provider_authority_without_guard())
+}
+
+#[cfg(test)]
+pub(crate) fn test_remote_session_with_deferred_attach()
+-> (Session, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (session, started, release) = remote::test_session_with_deferred_attach();
+    (Session::Remote(session), started, release)
 }
 
 #[cfg(test)]

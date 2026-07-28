@@ -1,6 +1,19 @@
-import { describe, expect, it } from "vitest";
-import type { RenderCursor, RenderDeltaEvent, RenderRow, RenderStateEvent } from "cmux/browser";
-import { applyDelta, applySnapshot } from "../src/lib/renderModel";
+import { describe, expect, it, vi } from "vitest";
+import type {
+  RenderGraphicImage,
+  RenderCursor,
+  RenderDeltaEvent,
+  RenderGraphics,
+  RenderRow,
+  RenderStateEvent,
+} from "cmux/browser";
+import { decodeRenderGraphicImage } from "../src/lib/renderGraphics";
+import * as renderModelApi from "../src/lib/renderModel";
+import {
+  applyDelta,
+  applySnapshot,
+  releaseRenderModelGraphicsBudget,
+} from "../src/lib/renderModel";
 
 const cursor: RenderCursor = {
   x: 1,
@@ -15,7 +28,50 @@ function row(index: number, text: string): RenderRow {
   return { row: index, runs: [{ text, fg: null, bg: null, attrs: 0 }] };
 }
 
-function snapshot(rows: RenderRow[] = [row(0, "one"), row(1, "two")]): RenderStateEvent {
+const graphics: RenderGraphics = {
+  generation: 4,
+  images: [{
+    id: 9,
+    generation: 2,
+    width: 1,
+    height: 1,
+    format: "rgba",
+    data: "/wAA/w==",
+  }, {
+    id: 10,
+    generation: 1,
+    width: 1,
+    height: 1,
+    format: "rgb",
+    data: "AP8A",
+  }],
+  placements: [{
+    image_id: 9,
+    placement_id: 3,
+    ordinal: 0,
+    x_offset: 0,
+    y_offset: 0,
+    source_x: 0,
+    source_y: 0,
+    source_width: 1,
+    source_height: 1,
+    columns: 1,
+    rows: 1,
+    grid_cols: 1,
+    grid_rows: 1,
+    pixel_width: 8,
+    pixel_height: 16,
+    viewport_col: 1,
+    viewport_row: 0,
+    viewport_visible: true,
+    z: 0,
+  }],
+};
+
+function snapshot(
+  rows: RenderRow[] = [row(0, "one"), row(1, "two")],
+  renderGraphics: RenderGraphics | undefined = graphics,
+): RenderStateEvent {
   return {
     event: "render-state",
     surface: 7,
@@ -25,6 +81,7 @@ function snapshot(rows: RenderRow[] = [row(0, "one"), row(1, "two")]): RenderSta
     default_bg: "#111111",
     scrollback_rows: 12,
     rows,
+    graphics: renderGraphics,
   };
 }
 
@@ -89,5 +146,279 @@ describe("render model", () => {
     expect(updated.rows).toBe(initial.rows);
     expect(updated.cursor).toMatchObject({ x: 2, style: "bar", visible: false });
     expect(updated.defaultBg).toBe("#222222");
+  });
+
+  it("applies image pixels and authoritative placements from snapshots and deltas", () => {
+    const initial = applySnapshot(snapshot());
+    const moved = applyDelta(initial, delta({
+      graphics: {
+        generation: 4,
+        placements: [{ ...graphics.placements[0], viewport_col: 2 }],
+      },
+    }));
+    const replaced = applyDelta(moved, delta({
+      graphics: {
+        generation: 5,
+        images: [{
+          ...graphics.images![0],
+          generation: 3,
+          data: "AAD//w==",
+        }],
+        placements: [{ ...graphics.placements[0], viewport_col: 3 }],
+      },
+    }));
+
+    expect(initial.graphics.images[0]?.data).toBe("/wAA/w==");
+    expect(moved.graphics.images).toBe(initial.graphics.images);
+    expect(moved.graphics.placements[0]?.viewport_col).toBe(2);
+    expect(replaced.graphics.images[0]).toMatchObject({ generation: 3, data: "AAD//w==" });
+    expect(replaced.graphics.images[1]).toBe(initial.graphics.images[1]);
+    expect(replaced.graphics.placements[0]?.viewport_col).toBe(3);
+  });
+
+  it("does not scan image payload characters on the browser thread", () => {
+    const charCodeAt = vi.spyOn(String.prototype, "charCodeAt");
+    try {
+      const initial = applySnapshot(snapshot());
+      expect(charCodeAt).not.toHaveBeenCalled();
+
+      const moved = applyDelta(initial, delta({
+        graphics: {
+          generation: 5,
+          placements: [{ ...graphics.placements[0], viewport_col: 2 }],
+        },
+      }));
+      expect(moved.graphics.images).toBe(initial.graphics.images);
+      expect(charCodeAt).not.toHaveBeenCalled();
+
+      applyDelta(moved, delta({
+        graphics: {
+          generation: 6,
+          images: [{
+            ...graphics.images![0],
+            generation: 3,
+            data: "AAD//w==",
+          }],
+        },
+      }));
+      expect(charCodeAt).not.toHaveBeenCalled();
+    } finally {
+      charCodeAt.mockRestore();
+    }
+  });
+
+  it("preserves placements for image-only graphics deltas", () => {
+    const initial = applySnapshot(snapshot());
+    const replaced = applyDelta(initial, delta({
+      graphics: {
+        generation: 5,
+        images: [{
+          ...graphics.images![0],
+          generation: 3,
+          data: "AAD//w==",
+        }],
+      },
+    }));
+
+    expect(replaced.graphics.images[0]).toMatchObject({ generation: 3, data: "AAD//w==" });
+    expect(replaced.graphics.placements).toBe(initial.graphics.placements);
+  });
+
+  it("removes images and placements only when a graphics update says they are gone", () => {
+    const initial = applySnapshot(snapshot());
+    const textOnly = applyDelta(initial, delta({ rows: [row(0, "text")] }));
+    const removed = applyDelta(textOnly, delta({
+      graphics: {
+        generation: 5,
+        removed_image_ids: [9, 10],
+        placements: [],
+      },
+    }));
+
+    expect(textOnly.graphics).toBe(initial.graphics);
+    expect(textOnly.rows[0]?.runs[0]?.text).toBe("text");
+    expect(removed.graphics.images).toEqual([]);
+    expect(removed.graphics.placements).toEqual([]);
+  });
+
+  it("starts with empty graphics when attached to an older additive protocol server", () => {
+    expect(applySnapshot({ ...snapshot(), graphics: undefined }).graphics).toEqual({
+      generation: 0,
+      images: [],
+      placements: [],
+    });
+  });
+
+  it("bounds encoded image payloads and requests a resnapshot when capacity returns", async () => {
+    const encodedBudget = {};
+    const budgetedApplySnapshot = applySnapshot as unknown as (
+      event: RenderStateEvent,
+      budget: object,
+      owner: object,
+    ) => ReturnType<typeof applySnapshot>;
+    const data = `${"A".repeat(13_333_334)}==`;
+    const image: RenderGraphicImage = {
+      id: 1,
+      generation: 1,
+      width: 2_500_000,
+      height: 1,
+      format: "rgba",
+      data,
+    };
+
+    const owners = Array.from({ length: 7 }, () => ({}));
+    const models = owners.map((owner) =>
+      budgetedApplySnapshot(
+        snapshot([], { generation: 1, images: [image], placements: [] }),
+        encodedBudget,
+        owner,
+      )
+    );
+    const retained = models.reduce(
+      (total, model) =>
+        total + model.graphics.images.reduce((sum, candidate) => sum + candidate.data.length, 0),
+      0,
+    );
+
+    expect(retained).toBeLessThanOrEqual(64 * 1024 * 1024);
+    expect(models.some((model) => model.graphics.images.length === 0)).toBe(true);
+
+    const subscribe = (
+      renderModelApi as unknown as {
+        subscribeRenderModelGraphicsBudget?: (
+          budget: object,
+          owner: object,
+          listener: () => void,
+        ) => () => void;
+      }
+    ).subscribeRenderModelGraphicsBudget;
+    if (subscribe === undefined) {
+      throw new Error("encoded graphics budget does not expose recovery subscriptions");
+    }
+    const requestResnapshot = vi.fn();
+    const unsubscribe = subscribe(encodedBudget, owners.at(-1)!, requestResnapshot);
+    const budgetedApplyDelta = applyDelta as unknown as (
+      model: ReturnType<typeof applySnapshot>,
+      event: RenderDeltaEvent,
+      budget: object,
+      owner: object,
+    ) => ReturnType<typeof applyDelta>;
+    budgetedApplyDelta(
+      models.at(-1)!,
+      delta({ graphics: { generation: 2, placements: [] } }),
+      encodedBudget,
+      owners.at(-1)!,
+    );
+    releaseRenderModelGraphicsBudget(encodedBudget, owners[0]!);
+    await Promise.resolve();
+    expect(requestResnapshot).toHaveBeenCalledTimes(1);
+    unsubscribe();
+
+    const recovered = budgetedApplySnapshot(
+      snapshot([], { generation: 2, images: [image], placements: [] }),
+      encodedBudget,
+      owners.at(-1)!,
+    );
+    expect(recovered.graphics.images).toHaveLength(1);
+  });
+
+  it("rejects snapshots whose retained images exceed the decoded byte budget", () => {
+    const image = (id: number): RenderGraphicImage => ({
+      id,
+      generation: 1,
+      width: 1_250_001,
+      height: 1,
+      format: "rgba",
+      data: "A".repeat(6_666_672),
+    });
+
+    expect(() => applySnapshot(snapshot([], {
+      generation: 1,
+      images: [image(1), image(2)],
+      placements: [],
+    }))).toThrow(/exceeds 10000000 decoded image bytes/);
+  });
+
+  it("rejects incremental image growth beyond the authoritative byte budget", () => {
+    const image = (id: number): RenderGraphicImage => ({
+      id,
+      generation: 1,
+      width: 1_250_000,
+      height: 1,
+      format: "rgba",
+      data: `${"A".repeat(6_666_667)}=`,
+    });
+    const initial = applySnapshot(snapshot([], {
+      generation: 1,
+      images: [image(1)],
+      placements: [],
+    }));
+
+    expect(() => applyDelta(initial, delta({
+      graphics: { generation: 2, images: [image(2)] },
+    }))).not.toThrow();
+    const full = applyDelta(initial, delta({
+      graphics: { generation: 2, images: [image(2)] },
+    }));
+    expect(() => applyDelta(full, delta({
+      graphics: { generation: 3, images: [{ ...image(3), width: 1, data: "AAAAAA==" }] },
+    }))).toThrow(/exceeds 10000000 decoded image bytes/);
+  });
+
+  it("rejects too many retained images across incremental deltas", () => {
+    const images = Array.from({ length: 4_096 }, (_, index): RenderGraphicImage => ({
+      id: index,
+      generation: 1,
+      width: 1,
+      height: 1,
+      format: "rgb",
+      data: "AAAA",
+    }));
+    const initial = applySnapshot(snapshot([], {
+      generation: 1,
+      images,
+      placements: [],
+    }));
+
+    expect(() => applyDelta(initial, delta({
+      graphics: {
+        generation: 2,
+        images: [{ ...images[0]!, id: images.length }],
+      },
+    }))).toThrow(/exceeds 4096 images/);
+  });
+
+  it("rejects encoded image data that does not match its dimensions", () => {
+    expect(() => applySnapshot(snapshot([], {
+      generation: 1,
+      images: [{
+        id: 1,
+        generation: 1,
+        width: 1,
+        height: 1,
+        format: "rgba",
+        data: "A".repeat(1_000_000),
+      }],
+      placements: [],
+    }))).toThrow(/pixel data does not match its dimensions/);
+  });
+
+  it("defers full base64 validation to the image decoder", () => {
+    const image: RenderGraphicImage = {
+      id: 1,
+      generation: 1,
+      width: 1,
+      height: 1,
+      format: "rgb",
+      data: "AAA!",
+    };
+    const model = applySnapshot(snapshot([], {
+      generation: 1,
+      images: [image],
+      placements: [],
+    }));
+
+    expect(model.graphics.images).toHaveLength(1);
+    expect(decodeRenderGraphicImage(image)).toBeNull();
   });
 });

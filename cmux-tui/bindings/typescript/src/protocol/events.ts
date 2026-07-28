@@ -4,6 +4,8 @@ import type {
   Base64,
   ColorHex,
   Id,
+  KittyGraphicsState,
+  KittyImageAlias,
   NotificationLevel,
 } from "./common.js";
 import type { ClientTransport } from "./commands.js";
@@ -200,6 +202,10 @@ export interface VtStateEvent {
   cols: number;
   rows: number;
   data: Base64;
+  /** Protocol v9 aliases needed to resolve Kitty image-number references in `data`. */
+  kitty_image_aliases?: KittyImageAlias[];
+  /** Protocol v10 resource limits and per-screen automatic image-ID cursors. */
+  kitty_graphics_state?: KittyGraphicsState;
   /** Protocol v6 additive extension. Older servers omit this field. */
   colors?: TerminalColors;
 }
@@ -218,6 +224,10 @@ interface ResizedEventBase {
   surface: Id;
   cols: number;
   rows: number;
+  /** Protocol v9 aliases needed to resolve Kitty image-number references in the replay. */
+  kitty_image_aliases?: KittyImageAlias[];
+  /** Protocol v10 resource limits and per-screen automatic image-ID cursors. */
+  kitty_graphics_state?: KittyGraphicsState;
   /** Protocol v7 theme-portable color snapshot for the replacement replay. Older servers omit it. */
   colors?: TerminalColors;
 }

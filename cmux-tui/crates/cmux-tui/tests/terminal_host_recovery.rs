@@ -25,6 +25,8 @@ use cmux_tui_core::terminal_host_runtime::{
 };
 use ghostty_vt::{Rgb, TerminalColorOverrides};
 
+const KITTY_REPLAY_STATE_ENCODED_LEN: usize = 52;
+
 struct RecoveryHarness {
     child: Option<Child>,
     dir: PathBuf,
@@ -1961,7 +1963,10 @@ fn failed_terminate_and_rejected_resize_leave_live_record_discoverable() {
     assert_eq!(resized.flags, FLAG_COLORS_FOLLOW);
     assert_eq!(&resized.payload[..4], &[120, 0, 40, 0]);
     let replay_len = u32::from_le_bytes(resized.payload[4..8].try_into().unwrap()) as usize;
-    assert_eq!(resized.payload.len(), 8 + replay_len);
+    let alias_count_offset = 8 + replay_len;
+    assert_eq!(resized.payload.len(), alias_count_offset + 6 + KITTY_REPLAY_STATE_ENCODED_LEN);
+    assert_eq!(&resized.payload[alias_count_offset..alias_count_offset + 2], &0u16.to_le_bytes());
+    assert_eq!(&resized.payload[alias_count_offset + 2..alias_count_offset + 6], &[8, 0, 16, 0]);
     let colors = read_frame(&mut renderer.stream, MAX_FRAME_PAYLOAD).unwrap().unwrap();
     assert_eq!(colors.sequence, renderer.next_sequence);
     renderer.next_sequence = renderer.next_sequence.wrapping_add(1);
@@ -2012,10 +2017,17 @@ fn direct_renderer_becomes_sole_viewer_after_control_client_disconnect() {
         }),
     );
     let surface = created["surface"].as_u64().unwrap();
+    let metrics = request(
+        &harness.socket,
+        serde_json::json!({
+            "id":2,"cmd":"set-cell-pixels","width_px":9,"height_px":18,
+        }),
+    );
+    assert_eq!(metrics["failures"], serde_json::json!([]));
     let grant = request(
         &harness.socket,
         serde_json::json!({
-            "id":2,"cmd":"mint-terminal-renderer","surface":surface,"ttl_ms":10_000,
+            "id":3,"cmd":"mint-terminal-renderer","surface":surface,"ttl_ms":10_000,
         }),
     );
     let mut renderer = connect_host_detailed(
@@ -2036,6 +2048,7 @@ fn direct_renderer_becomes_sole_viewer_after_control_client_disconnect() {
     assert_eq!(resized.kind, MessageKind::Resized);
     assert_eq!(resized.flags, FLAG_COLORS_FOLLOW);
     assert_eq!(&resized.payload[..4], &[120, 0, 40, 0]);
+    assert_eq!(resize_cell_pixels(&resized.payload), (9, 18));
     let colors = read_frame(&mut renderer.stream, MAX_FRAME_PAYLOAD).unwrap().unwrap();
     assert_eq!(colors.kind, MessageKind::Colors);
 
@@ -2137,6 +2150,50 @@ fn negotiated_viewer_size_ack_skips_unchanged_replay_and_follows_changed_pair() 
     assert_eq!(renderer.hello_flags, FLAG_VIEWER_SIZE_ACKS);
     renderer.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
+    let mut cell_pixels = Frame::new(MessageKind::SetCellPixelSize, Vec::new());
+    cell_pixels.request_id = 41;
+    cell_pixels.payload.extend_from_slice(&11u16.to_le_bytes());
+    cell_pixels.payload.extend_from_slice(&22u16.to_le_bytes());
+    write_frame(&mut renderer.stream, &cell_pixels).unwrap();
+    let resized = read_frame(&mut renderer.stream, MAX_FRAME_PAYLOAD).unwrap().unwrap();
+    assert_eq!(resized.kind, MessageKind::Resized);
+    assert_eq!(resized.flags, FLAG_COLORS_FOLLOW);
+    assert_eq!(resized.request_id, 0);
+    assert_eq!(resized.sequence, renderer.next_sequence);
+    renderer.next_sequence = renderer.next_sequence.wrapping_add(1);
+    assert_eq!(resize_cell_pixels(&resized.payload), (11, 22));
+    let colors = read_frame(&mut renderer.stream, MAX_FRAME_PAYLOAD).unwrap().unwrap();
+    assert_eq!(colors.kind, MessageKind::Colors);
+    assert_eq!(colors.request_id, 0);
+    assert_eq!(colors.sequence, renderer.next_sequence);
+    renderer.next_sequence = renderer.next_sequence.wrapping_add(1);
+    let ack = read_frame(&mut renderer.stream, MAX_FRAME_PAYLOAD).unwrap().unwrap();
+    assert_eq!(ack.kind, MessageKind::CellPixelSizeAck);
+    assert_eq!(ack.request_id, 41);
+    assert_eq!(ack.sequence, 0);
+    assert_eq!(ack.payload, vec![11, 0, 22, 0]);
+
+    let resnapshot_grant = request(
+        &harness.socket,
+        serde_json::json!({
+            "id":3,"cmd":"mint-terminal-renderer","surface":surface,"ttl_ms":10_000,
+        }),
+    );
+    let resnapshot = connect_host_detailed(
+        resnapshot_grant["endpoint"].as_str().unwrap(),
+        resnapshot_grant["terminal_id"].as_str().unwrap(),
+        resnapshot_grant["token"].as_str().unwrap(),
+        ClientRole::Renderer,
+        CapabilityRights::RENDERER,
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot_cell_pixels(&resnapshot.snapshot.payload),
+        (11, 22),
+        "a reconnect snapshot must expose the host's committed cell geometry"
+    );
+    drop(resnapshot);
+
     let mut unchanged = Frame::new(MessageKind::ViewerSize, Vec::new());
     unchanged.request_id = 42;
     unchanged.payload.extend_from_slice(&80u16.to_le_bytes());
@@ -2162,7 +2219,10 @@ fn negotiated_viewer_size_ack_skips_unchanged_replay_and_follows_changed_pair() 
     renderer.next_sequence = renderer.next_sequence.wrapping_add(1);
     assert_eq!(&resized.payload[..4], &[70, 0, 20, 0]);
     let replay_len = u32::from_le_bytes(resized.payload[4..8].try_into().unwrap()) as usize;
-    assert_eq!(resized.payload.len(), 8 + replay_len);
+    let alias_count_offset = 8 + replay_len;
+    assert_eq!(resized.payload.len(), alias_count_offset + 6 + KITTY_REPLAY_STATE_ENCODED_LEN);
+    assert_eq!(&resized.payload[alias_count_offset..alias_count_offset + 2], &0u16.to_le_bytes());
+    assert_eq!(&resized.payload[alias_count_offset + 2..alias_count_offset + 6], &[11, 0, 22, 0]);
     let colors = read_frame(&mut renderer.stream, MAX_FRAME_PAYLOAD).unwrap().unwrap();
     assert_eq!(colors.kind, MessageKind::Colors);
     assert_eq!(colors.flags, 0);
@@ -2180,7 +2240,7 @@ fn negotiated_viewer_size_ack_skips_unchanged_replay_and_follows_changed_pair() 
     changed_ack.extend_from_slice(&RESIZE_ACK_CANONICAL_CHANGED.to_le_bytes());
     assert_eq!(ack.payload, changed_ack);
 
-    request(&harness.socket, serde_json::json!({"id":3,"cmd":"close-surface","surface":surface}));
+    request(&harness.socket, serde_json::json!({"id":4,"cmd":"close-surface","surface":surface}));
     wait_for_no_host_records(&harness.host_root());
 }
 
@@ -2728,6 +2788,38 @@ fn snapshot_replay(payload: &[u8]) -> &[u8] {
     let end = 12usize.checked_add(replay_len).expect("Snapshot replay length overflow");
     assert!(end <= payload.len(), "Snapshot replay was truncated");
     &payload[12..end]
+}
+
+fn snapshot_cell_pixels(payload: &[u8]) -> (u16, u16) {
+    assert!(
+        payload.len() >= 4 + KITTY_REPLAY_STATE_ENCODED_LEN,
+        "Snapshot payload omitted cell geometry"
+    );
+    let offset = payload.len() - KITTY_REPLAY_STATE_ENCODED_LEN - 4;
+    (
+        u16::from_le_bytes(payload[offset..offset + 2].try_into().unwrap()),
+        u16::from_le_bytes(payload[offset + 2..offset + 4].try_into().unwrap()),
+    )
+}
+
+fn resize_cell_pixels(payload: &[u8]) -> (u16, u16) {
+    assert!(payload.len() >= 8, "Resized payload was truncated");
+    let replay_len = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    let alias_count_offset = 8usize.checked_add(replay_len).expect("replay length overflow");
+    assert!(alias_count_offset + 2 <= payload.len(), "Resized payload omitted Kitty alias count");
+    let alias_count =
+        u16::from_le_bytes(payload[alias_count_offset..alias_count_offset + 2].try_into().unwrap())
+            as usize;
+    let offset = alias_count_offset + 2 + alias_count * 8;
+    assert_eq!(
+        payload.len(),
+        offset + 4 + KITTY_REPLAY_STATE_ENCODED_LEN,
+        "Resized payload has an invalid suffix"
+    );
+    (
+        u16::from_le_bytes(payload[offset..offset + 2].try_into().unwrap()),
+        u16::from_le_bytes(payload[offset + 2..offset + 4].try_into().unwrap()),
+    )
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

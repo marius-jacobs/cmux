@@ -12,10 +12,13 @@ import type {
   NewPaneRightOptions,
   RenderAttachEvent,
   RenderDeltaEvent,
+  RenderGraphics,
+  RenderGraphicsDelta,
   RenderStateEvent,
   Screen,
   Tree,
   TreeDeltaEvent,
+  VtStateResult,
 } from "../src/browser.js";
 
 const failureResponse: CmuxFailureResponse = {
@@ -142,6 +145,25 @@ const identify: IdentifyData = {
 };
 void identify;
 
+const vtStateWithKittyAliases: VtStateResult = {
+  cols: 80,
+  rows: 24,
+  data: "",
+  kitty_image_aliases: [{ image_id: 7, image_number: 70 }],
+  kitty_graphics_state: {
+    image_bytes: 32000000,
+    inflight_bytes: 8000000,
+    images: 1024,
+    placements: 4096,
+    replay_cursor_offset: 0,
+    primary_replay_next_image_id: 41,
+    primary_next_image_id: 42,
+    alternate_replay_next_image_id: 43,
+    alternate_next_image_id: 44,
+  },
+};
+void vtStateWithKittyAliases;
+
 type LegacyWorkspaceMutationData = CmuxResponseData<{
   cmd: "close-workspace";
   workspace: number;
@@ -205,6 +227,8 @@ const protocolV7Resize: KnownCmuxEvent = {
   rows: 24,
   replay: "cmVwbGF5",
   colors: colorsChanged,
+  kitty_image_aliases: [{ image_id: 7, image_number: 70 }],
+  kitty_graphics_state: vtStateWithKittyAliases.kitty_graphics_state,
 };
 const clientEvents: KnownCmuxEvent[] = [
   { event: "client-attached", client: 2, transport: "ws", name: "browser", kind: "web" },
@@ -227,6 +251,44 @@ void protocolV7Resize;
 void clientEvents;
 void resizeFailed;
 
+const renderGraphics: RenderGraphics = {
+  generation: 4,
+  images: [{
+    id: 9,
+    generation: 2,
+    width: 1,
+    height: 1,
+    format: "rgba",
+    data: "/wAA/w==",
+  }],
+  placements: [{
+    image_id: 9,
+    placement_id: 3,
+    ordinal: 0,
+    x_offset: 0,
+    y_offset: 0,
+    source_x: 0,
+    source_y: 0,
+    source_width: 1,
+    source_height: 1,
+    columns: 1,
+    rows: 1,
+    grid_cols: 1,
+    grid_rows: 1,
+    pixel_width: 8,
+    pixel_height: 16,
+    viewport_col: 0,
+    viewport_row: 0,
+    viewport_visible: true,
+    z: 0,
+  }],
+};
+const imageOnlyRenderGraphics: RenderGraphicsDelta = {
+  generation: 5,
+  images: renderGraphics.images,
+};
+void imageOnlyRenderGraphics;
+
 const renderState: RenderStateEvent = {
   event: "render-state",
   surface: 1,
@@ -239,6 +301,7 @@ const renderState: RenderStateEvent = {
     row: 0,
     runs: [{ text: "$ x", fg: null, bg: null, attrs: 1, underline: "curly", width_hint: 3 }],
   }],
+  graphics: renderGraphics,
 };
 const renderDelta: RenderDeltaEvent = {
   event: "render-delta",
@@ -246,6 +309,11 @@ const renderDelta: RenderDeltaEvent = {
   cursor: renderState.cursor,
   full: false,
   rows: [],
+  graphics: {
+    generation: renderGraphics.generation,
+    removed_image_ids: [99],
+    placements: renderGraphics.placements,
+  },
 };
 const treeDelta: TreeDeltaEvent = {
   event: "tab-renamed",
@@ -303,6 +371,7 @@ const invalidMovedWorkspaceDelta: TreeDeltaEvent = {
 };
 void renderState;
 void renderDelta;
+void renderGraphics;
 void treeDelta;
 void legacyWorkspaceDelta;
 void movedWorkspaceDelta;

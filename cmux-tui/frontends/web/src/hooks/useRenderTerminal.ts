@@ -9,6 +9,7 @@ import {
   type RenderRow,
   type RenderStateEvent,
 } from "cmux/browser";
+import { useRenderGraphicsModelBudget } from "../components/RenderGraphics";
 import { ATTACH_RECOVERY_STABLE_MS, attachRecoveryDelay } from "../lib/attachRecovery";
 import { debounce } from "../lib/debounce";
 import { t } from "../i18n";
@@ -17,7 +18,13 @@ import { nextFitSize, type TerminalSize } from "../lib/fit";
 import { createFrameBatch } from "../lib/frameBatch";
 import { encodeTerminalKey } from "../lib/keyEncoding";
 import { beginTerminalSelection, clampTerminalSelection, releaseTerminalSelection } from "../lib/terminalSelection";
-import { applyDelta, applySnapshot, type RenderModel } from "../lib/renderModel";
+import {
+  applyDelta,
+  applySnapshot,
+  releaseRenderModelGraphicsBudget,
+  subscribeRenderModelGraphicsBudget,
+  type RenderModel,
+} from "../lib/renderModel";
 import {
   createScrollbackWindow,
   latestScrollbackRequest,
@@ -114,6 +121,8 @@ export function useRenderTerminal({
   const [host, setHost] = useState<HTMLDivElement | null>(null);
   const [state, dispatch] = useReducer(renderTerminalViewReducer, initialState);
   const controllerRef = useRef<RenderTerminalController | null>(null);
+  const graphicsBudget = useRenderGraphicsModelBudget();
+  const graphicsBudgetOwner = useRef<object>({}).current;
   const activeRef = useRef(active);
   activeRef.current = active;
   const terminalRef = useCallback((node: HTMLDivElement | null) => setHost(node), []);
@@ -141,6 +150,7 @@ export function useRenderTerminal({
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let stableTimer: ReturnType<typeof setTimeout> | undefined;
     let wakeRetry: (() => void) | null = null;
+    let graphicsResnapshotRequested = false;
     const frames = new Set<number>();
     const stage = host.closest<HTMLElement>(".terminal-stage");
     const scroller = host.querySelector<HTMLElement>("[data-render-scroll]");
@@ -160,6 +170,15 @@ export function useRenderTerminal({
           resolve();
         }, delayMs);
       });
+    const unsubscribeGraphicsBudget = subscribeRenderModelGraphicsBudget(
+      graphicsBudget,
+      graphicsBudgetOwner,
+      () => {
+        if (cancelled || graphicsResnapshotRequested) return;
+        graphicsResnapshotRequested = true;
+        stream?.close();
+      },
+    );
 
     dispatch({ type: "bind", client, surface });
     const frameBatch = createFrameBatch<void>(() => {
@@ -456,6 +475,12 @@ export function useRenderTerminal({
         for (;;) {
           stream = await client.attachSurface(surface, { mode: "render" });
           if (cancelled) return;
+          if (graphicsResnapshotRequested) {
+            stream.close();
+            stream = null;
+            graphicsResnapshotRequested = false;
+            continue;
+          }
           // Closing the previous attachment removes this client's report on
           // the server. Re-publish even when the viewport did not change.
           reportedFit = null;
@@ -466,13 +491,21 @@ export function useRenderTerminal({
               event = await stream.next();
             } catch (error) {
               if (cancelled) return;
+              if (graphicsResnapshotRequested) break;
               if (error instanceof CmuxTimeoutError) continue;
               throw error;
             }
             if (cancelled) return;
-            if (event.event === "detached") return;
+            if (event.event === "detached") {
+              if (graphicsResnapshotRequested) break;
+              return;
+            }
             if (event.event === "render-state") {
-              currentModel = applySnapshot(event as RenderStateEvent);
+              currentModel = applySnapshot(
+                event as RenderStateEvent,
+                graphicsBudget,
+                graphicsBudgetOwner,
+              );
               resetHistoryCache(currentModel.scrollbackRows, false);
               applySurfaceBackground(currentModel.defaultBg);
               applyFit();
@@ -485,7 +518,12 @@ export function useRenderTerminal({
             } else if (event.event === "render-delta" && currentModel !== null) {
               const renderDelta = event as RenderDeltaEvent;
               const previous: RenderModel = currentModel;
-              const nextModel: RenderModel = applyDelta(previous, renderDelta);
+              const nextModel: RenderModel = applyDelta(
+                previous,
+                renderDelta,
+                graphicsBudget,
+                graphicsBudgetOwner,
+              );
               currentModel = nextModel;
               if (nextModel === previous) continue;
               const reconciliation = reconcileScrollbackWindow(
@@ -522,6 +560,10 @@ export function useRenderTerminal({
           }
           stream.close();
           stream = null;
+          if (graphicsResnapshotRequested) {
+            graphicsResnapshotRequested = false;
+            continue;
+          }
           if (!overflowed) return;
           const delayMs = attachRecoveryDelay(recoveryAttempt++);
           if (delayMs === null) throw new Error(t("attachOverflowRecoveryFailed"));
@@ -546,6 +588,7 @@ export function useRenderTerminal({
     sendResize();
     return () => {
       cancelled = true;
+      unsubscribeGraphicsBudget();
       observer.disconnect();
       window.visualViewport?.removeEventListener("resize", sendResize);
       window.visualViewport?.removeEventListener("scroll", sendResize);
@@ -575,10 +618,19 @@ export function useRenderTerminal({
       void client.releaseSurfaceSize(surface).catch(onError);
       stage?.style.removeProperty("--surface-background");
       releaseTerminalSelection(host);
+      releaseRenderModelGraphicsBudget(graphicsBudget, graphicsBudgetOwner);
       if (controllerRef.current === controller) controllerRef.current = null;
       dispatch({ type: "reset", client, surface });
     };
-  }, [client, focusOnMount, host, onError, surface]);
+  }, [
+    client,
+    focusOnMount,
+    graphicsBudget,
+    graphicsBudgetOwner,
+    host,
+    onError,
+    surface,
+  ]);
 
   const backToLive = useCallback(() => controllerRef.current?.backToLive(), []);
   const sendKey = useCallback((key: string) => controllerRef.current?.sendKey(key), []);

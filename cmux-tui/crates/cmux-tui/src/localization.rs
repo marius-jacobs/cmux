@@ -23,6 +23,12 @@ pub(crate) struct ForeignViewportMessages {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub(crate) struct GraphicsMessages {
+    pub output_failed: &'static str,
+    pub parser_recovery_failed: &'static str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TerminalMessages {
     pub clear_history_help: &'static str,
     pub clear_history_failed: &'static str,
@@ -243,6 +249,13 @@ impl ConfigMessages {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AttachMessages {
     pub filtered_subscription_unavailable: &'static str,
+    pub remote_attach_queue_full: &'static str,
+    remote_attach_workers_failed_template: &'static str,
+    surface_sync_failed_template: &'static str,
+    surface_sync_unknown_template: &'static str,
+    surface_sync_attach: &'static str,
+    surface_sync_resize: &'static str,
+    surface_sync_operation: &'static str,
     unknown_terminal_prefix: &'static str,
     unknown_terminal_suffix: &'static str,
     ambiguous_terminal_prefix: &'static str,
@@ -252,6 +265,32 @@ pub(crate) struct AttachMessages {
 }
 
 impl AttachMessages {
+    pub fn remote_attach_workers_failed(&self, error: &str) -> String {
+        self.remote_attach_workers_failed_template.replace("{error}", error)
+    }
+
+    fn surface_sync_operation(&self, operation: &str) -> &'static str {
+        match operation {
+            "attach" => self.surface_sync_attach,
+            "resize" => self.surface_sync_resize,
+            _ => self.surface_sync_operation,
+        }
+    }
+
+    pub fn surface_sync_failed(&self, surface: u64, operation: &str, error: &str) -> String {
+        self.surface_sync_failed_template
+            .replace("{surface}", &surface.to_string())
+            .replace("{operation}", self.surface_sync_operation(operation))
+            .replace("{error}", error)
+    }
+
+    pub fn surface_sync_unknown(&self, surface: u64, operation: &str, error: &str) -> String {
+        self.surface_sync_unknown_template
+            .replace("{surface}", &surface.to_string())
+            .replace("{operation}", self.surface_sync_operation(operation))
+            .replace("{error}", error)
+    }
+
     pub fn unknown_terminal(&self, reference: &str) -> String {
         format!("{}{reference:?}{}", self.unknown_terminal_prefix, self.unknown_terminal_suffix)
     }
@@ -428,6 +467,7 @@ pub(crate) struct Catalog {
     japanese: bool,
     pub pairing: PairingMessages,
     pub foreign_viewport: ForeignViewportMessages,
+    pub graphics: GraphicsMessages,
     pub terminal: TerminalMessages,
     pub machine_agent: MachineAgentMessages,
     pub menu: MenuMessages,
@@ -456,6 +496,10 @@ static ENGLISH: Catalog = Catalog {
         approve: "[ Approve enter ]",
     },
     foreign_viewport: ForeignViewportMessages { terminal_grid: "terminal grid" },
+    graphics: GraphicsMessages {
+        output_failed: "Terminal graphics output failed; restoring the terminal",
+        parser_recovery_failed: "Terminal graphics output could not reset the terminal parser; restoring the terminal",
+    },
     terminal: TerminalMessages {
         clear_history_help: "Clear PTY history while preserving its active prompt.",
         clear_history_failed: "Could not clear terminal history",
@@ -586,6 +630,13 @@ edits shell files. Authenticate with the configured host before retrying.
     },
     attach: AttachMessages {
         filtered_subscription_unavailable: "single-terminal attach requires a newer cmux-tui server; restart the session",
+        remote_attach_queue_full: "remote surface attach queue is full",
+        remote_attach_workers_failed_template: "could not start surface attach workers: {error}",
+        surface_sync_failed_template: "surface {surface} {operation} failed; retries are rate-limited: {error}",
+        surface_sync_unknown_template: "surface {surface} {operation} outcome is unknown; detach and reconnect before sending more input: {error}",
+        surface_sync_attach: "attach",
+        surface_sync_resize: "resize",
+        surface_sync_operation: "operation",
         unknown_terminal_prefix: "unknown terminal ",
         unknown_terminal_suffix: "; use `cmux-tui ids` to list surfaces",
         ambiguous_terminal_prefix: "ambiguous terminal reference ",
@@ -688,6 +739,10 @@ static JAPANESE: Catalog = Catalog {
         approve: "[ 承認 enter ]",
     },
     foreign_viewport: ForeignViewportMessages { terminal_grid: "端末グリッド" },
+    graphics: GraphicsMessages {
+        output_failed: "ターミナル画像の出力に失敗したため、ターミナルを復元します",
+        parser_recovery_failed: "ターミナル画像の出力後にパーサーをリセットできなかったため、ターミナルを復元します",
+    },
     terminal: TerminalMessages {
         clear_history_help: "アクティブなプロンプトを保持したまま PTY 履歴を消去します。",
         clear_history_failed: "ターミナル履歴を消去できませんでした",
@@ -818,6 +873,13 @@ cmux machine-agent - ローカルの cmux セッションをリモートサー�
     },
     attach: AttachMessages {
         filtered_subscription_unavailable: "単一ターミナルへの接続には新しい cmux-tui サーバーが必要です。セッションを再起動してください",
+        remote_attach_queue_full: "リモートサーフェス接続キューがいっぱいです",
+        remote_attach_workers_failed_template: "リモートサーフェス接続ワーカーを開始できませんでした: {error}",
+        surface_sync_failed_template: "サーフェス {surface} の{operation}に失敗しました。再試行は制限されています: {error}",
+        surface_sync_unknown_template: "サーフェス {surface} の{operation}結果は不明です。入力を続ける前に切断して再接続してください: {error}",
+        surface_sync_attach: "接続",
+        surface_sync_resize: "サイズ変更",
+        surface_sync_operation: "操作",
         unknown_terminal_prefix: "ターミナル ",
         unknown_terminal_suffix: " が見つかりません。`cmux-tui ids` でサーフェス一覧を確認してください",
         ambiguous_terminal_prefix: "ターミナル参照 ",
@@ -946,6 +1008,19 @@ mod tests {
         assert_eq!(
             JAPANESE.attach.filtered_subscription_unavailable,
             "単一ターミナルへの接続には新しい cmux-tui サーバーが必要です。セッションを再起動してください"
+        );
+        assert_eq!(ENGLISH.attach.remote_attach_queue_full, "remote surface attach queue is full");
+        assert_eq!(
+            JAPANESE.attach.remote_attach_queue_full,
+            "リモートサーフェス接続キューがいっぱいです"
+        );
+        assert_eq!(
+            ENGLISH.attach.remote_attach_workers_failed("os detail"),
+            "could not start surface attach workers: os detail"
+        );
+        assert_eq!(
+            JAPANESE.attach.remote_attach_workers_failed("os detail"),
+            "リモートサーフェス接続ワーカーを開始できませんでした: os detail"
         );
         assert_eq!(
             ENGLISH.attach.unknown_terminal("missing"),

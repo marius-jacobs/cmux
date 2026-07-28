@@ -4,12 +4,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use ghostty_vt::KittyGraphicsLimits;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
@@ -50,6 +51,165 @@ const WORKSPACE_KEY_MAX_BYTES: usize = 256;
 const WORKSPACE_NAME_MAX_BYTES: usize = 1_024;
 const PROVIDER_WORKSPACE_AUTHORITY_MIN_BYTES: usize = 32;
 const PROVIDER_WORKSPACE_AUTHORITY_MAX_BYTES: usize = 512;
+const CELL_PIXEL_FANOUT_MAX_WORKERS: usize = 32;
+const DEADLINE_FANOUT_QUEUE_CAPACITY: usize = CELL_PIXEL_FANOUT_MAX_WORKERS * 8;
+const CELL_PIXEL_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const CELL_PIXEL_RETRY_MAX: Duration = Duration::from_millis(250);
+const CELL_PIXEL_RETRY_MAX_ATTEMPTS: u8 = 4;
+const KITTY_IMAGE_BUDGET_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const KITTY_IMAGE_BUDGET_RETRY_MAX: Duration = Duration::from_secs(1);
+const KITTY_IMAGE_BUDGET_RETRY_MAX_ATTEMPTS: u32 = 4;
+pub(crate) const RENDER_ATTACHMENT_LIMIT: usize = 64;
+const KITTY_IMAGE_PROCESS_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+// libghostty owns independent primary and alternate screen stores. cmux also
+// keeps one replay pixel cache and one render pixel cache per PTY surface.
+// A grayscale native image expands by up to 3x in either RGB pixel cache.
+const KITTY_IMAGE_PERSISTENT_COPIES_PER_SURFACE: u64 = 2 + 3 + 3;
+const KITTY_INFLIGHT_PERSISTENT_COPIES_PER_SURFACE: u64 = 1;
+const KITTY_BYTE_OWNERS_PER_SURFACE: u64 =
+    KITTY_IMAGE_PERSISTENT_COPIES_PER_SURFACE + KITTY_INFLIGHT_PERSISTENT_COPIES_PER_SURFACE;
+// Image and placement limits are independent on the primary and alternate screens.
+const KITTY_OBJECT_OWNERS_PER_SURFACE: u64 = 2;
+const KITTY_IMAGE_PROCESS_BUDGET_COUNT: u64 = ghostty_vt::MAX_KITTY_IMAGES;
+const KITTY_PLACEMENT_PROCESS_BUDGET_COUNT: u64 = ghostty_vt::MAX_KITTY_PLACEMENTS;
+const KITTY_IMAGE_BUDGET_OWNER_LIMIT: usize = {
+    let image_limit = KITTY_IMAGE_PROCESS_BUDGET_COUNT / KITTY_OBJECT_OWNERS_PER_SURFACE;
+    let placement_limit = KITTY_PLACEMENT_PROCESS_BUDGET_COUNT / KITTY_OBJECT_OWNERS_PER_SURFACE;
+    if image_limit < placement_limit { image_limit as usize } else { placement_limit as usize }
+};
+
+fn cell_pixel_retry_delay(attempts: u8) -> Duration {
+    let multiplier = 1_u32.checked_shl(u32::from(attempts.saturating_sub(1))).unwrap_or(u32::MAX);
+    CELL_PIXEL_RETRY_INITIAL.saturating_mul(multiplier).min(CELL_PIXEL_RETRY_MAX)
+}
+
+fn kitty_image_budget_capacity(surface_count: usize, current: usize) -> usize {
+    if surface_count == 0 {
+        return 0;
+    }
+    // Keep hysteresis for larger buckets, but always restore the sole
+    // survivor's full share instead of stranding it in the two-surface bucket.
+    if current == 0
+        || surface_count > current
+        || surface_count <= current / 4
+        || (surface_count == 1 && current > 1)
+    {
+        return surface_count.checked_next_power_of_two().unwrap_or(usize::MAX);
+    }
+    current
+}
+
+fn kitty_image_limits_for_capacity(capacity: usize) -> KittyGraphicsLimits {
+    if capacity == 0 {
+        return KittyGraphicsLimits::disabled();
+    }
+    let surface_count = u64::try_from(capacity).unwrap_or(u64::MAX);
+    let persistent_owners = surface_count.saturating_mul(KITTY_BYTE_OWNERS_PER_SURFACE);
+    let image_bytes = KITTY_IMAGE_PROCESS_BUDGET_BYTES
+        .checked_div(persistent_owners)
+        .unwrap_or(0)
+        .min(ghostty_vt::MAX_KITTY_IMAGE_BYTES as u64);
+    let inflight_bytes = image_bytes.min(ghostty_vt::KITTY_INFLIGHT_REPLAY_MAX_BYTES as u64);
+    let object_owners = surface_count.saturating_mul(KITTY_OBJECT_OWNERS_PER_SURFACE);
+    let images = KITTY_IMAGE_PROCESS_BUDGET_COUNT
+        .checked_div(object_owners)
+        .unwrap_or(0)
+        .min(ghostty_vt::MAX_KITTY_IMAGES);
+    let placements = KITTY_PLACEMENT_PROCESS_BUDGET_COUNT
+        .checked_div(object_owners)
+        .unwrap_or(0)
+        .min(ghostty_vt::MAX_KITTY_PLACEMENTS);
+    KittyGraphicsLimits { image_bytes, inflight_bytes, images, placements }
+}
+
+fn kitty_image_limits_within(candidate: KittyGraphicsLimits, ceiling: KittyGraphicsLimits) -> bool {
+    candidate.image_bytes <= ceiling.image_bytes
+        && candidate.inflight_bytes <= ceiling.inflight_bytes
+        && candidate.images <= ceiling.images
+        && candidate.placements <= ceiling.placements
+}
+
+fn kitty_image_limits_exceed(candidate: KittyGraphicsLimits, ceiling: KittyGraphicsLimits) -> bool {
+    !kitty_image_limits_within(candidate, ceiling)
+}
+
+fn kitty_image_limits_enabled(limits: KittyGraphicsLimits) -> bool {
+    limits.image_bytes > 0
+        && limits.inflight_bytes > 0
+        && limits.images > 0
+        && limits.placements > 0
+}
+
+#[derive(Clone)]
+struct KittyImageBudgetEntry {
+    surface: Option<Weak<Surface>>,
+    applied: KittyGraphicsLimits,
+    owns_quota: bool,
+    removing: bool,
+}
+
+#[derive(Default)]
+struct KittyImageBudgetState {
+    entries: HashMap<SurfaceId, KittyImageBudgetEntry>,
+    blocked_surfaces: HashSet<SurfaceId>,
+    capacity: usize,
+    worker_running: bool,
+    expansion_in_flight: bool,
+}
+
+struct PendingKittyImageBudgetOperation {
+    surface_id: SurfaceId,
+    surface: Weak<Surface>,
+    limits: KittyGraphicsLimits,
+    expanding: bool,
+    result: DeadlinePending<anyhow::Result<()>>,
+}
+
+pub(crate) struct KittyImageBudgetReservation {
+    mux: Weak<Mux>,
+    surface: SurfaceId,
+    initial_limits: KittyGraphicsLimits,
+    committed: bool,
+}
+
+impl KittyImageBudgetReservation {
+    pub(crate) fn initial_limits(&self) -> KittyGraphicsLimits {
+        self.initial_limits
+    }
+
+    pub(crate) fn commit(
+        mut self,
+        surface: &Arc<Surface>,
+        applied: KittyGraphicsLimits,
+    ) -> anyhow::Result<()> {
+        if let Some(mux) = self.mux.upgrade() {
+            mux.commit_kitty_image_surface(self.surface, surface, applied)?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for KittyImageBudgetReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(mux) = self.mux.upgrade() {
+            mux.cancel_kitty_image_surface_reservation(self.surface);
+        }
+    }
+}
+
+pub(crate) struct RenderAttachmentPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for RenderAttachmentPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// An opaque per-mux credential provisioned by the external machine
 /// provider. Debug output is deliberately redacted.
@@ -167,6 +327,159 @@ pub(crate) fn clamp_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
     (cols.clamp(1, TERMINAL_DIMENSION_MAX), rows.clamp(1, TERMINAL_DIMENSION_MAX))
 }
 
+type DeadlineFanoutJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct DeadlineFanoutPool {
+    sender: SyncSender<DeadlineFanoutJob>,
+    permits: Arc<AtomicUsize>,
+}
+
+struct DeadlineFanoutPermit(Arc<AtomicUsize>);
+
+impl Drop for DeadlineFanoutPermit {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl DeadlineFanoutPool {
+    fn new() -> Option<Self> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<DeadlineFanoutJob>(DEADLINE_FANOUT_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut worker_count = 0;
+        for index in 0..CELL_PIXEL_FANOUT_MAX_WORKERS {
+            let receiver = receiver.clone();
+            let spawned = std::thread::Builder::new().name(format!("mux-deadline-{index}")).spawn(
+                move || {
+                    loop {
+                        let job = {
+                            let Ok(receiver) = receiver.lock() else { return };
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else { return };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                },
+            );
+            match spawned {
+                Ok(_) => worker_count += 1,
+                Err(_) => break,
+            }
+        }
+        (worker_count > 0)
+            .then(|| Self { sender, permits: Arc::new(AtomicUsize::new(worker_count)) })
+    }
+
+    fn submit(&self, job: DeadlineFanoutJob) -> bool {
+        if self
+            .permits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(1))
+            .is_err()
+        {
+            return false;
+        }
+        let permits = self.permits.clone();
+        if self
+            .sender
+            .try_send(Box::new(move || {
+                let _permit = DeadlineFanoutPermit(permits);
+                job();
+            }))
+            .is_ok()
+        {
+            true
+        } else {
+            self.permits.fetch_add(1, Ordering::Release);
+            false
+        }
+    }
+}
+
+fn deadline_fanout_pool() -> Option<&'static DeadlineFanoutPool> {
+    static POOL: OnceLock<Option<DeadlineFanoutPool>> = OnceLock::new();
+    POOL.get_or_init(DeadlineFanoutPool::new).as_ref()
+}
+
+struct DeadlinePending<R> {
+    result: Arc<Mutex<Option<R>>>,
+}
+
+impl<R> DeadlinePending<R> {
+    fn try_take(&self) -> Option<R> {
+        self.result.lock().unwrap().take()
+    }
+}
+
+enum DeadlineMapResult<R> {
+    Complete(R),
+    Pending(DeadlinePending<R>),
+    Unscheduled,
+}
+
+fn bounded_deadline_map<T, R, F>(
+    items: &[T],
+    deadline: Instant,
+    operation: F,
+) -> Vec<DeadlineMapResult<R>>
+where
+    T: Clone + Send + 'static,
+    R: Send + 'static,
+    F: Fn(&T, Instant) -> R + Send + Sync + 'static,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ordered = std::iter::repeat_with(|| DeadlineMapResult::Unscheduled)
+        .take(items.len())
+        .collect::<Vec<_>>();
+    let Some(pool) = deadline_fanout_pool() else { return ordered };
+    let operation = Arc::new(operation);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut submitted = 0;
+    for (index, item) in items.iter().cloned().enumerate() {
+        let sender = sender.clone();
+        let operation = operation.clone();
+        let result = Arc::new(Mutex::new(None));
+        let job_result = result.clone();
+        if pool.submit(Box::new(move || {
+            *job_result.lock().unwrap() = Some(operation(&item, deadline));
+            let _ = sender.send(index);
+        })) {
+            submitted += 1;
+            ordered[index] = DeadlineMapResult::Pending(DeadlinePending { result });
+        }
+    }
+    drop(sender);
+
+    while submitted > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(index) => {
+                let pending =
+                    std::mem::replace(&mut ordered[index], DeadlineMapResult::Unscheduled);
+                match pending {
+                    DeadlineMapResult::Pending(pending) => {
+                        if let Some(result) = pending.try_take() {
+                            ordered[index] = DeadlineMapResult::Complete(result);
+                            submitted -= 1;
+                        } else {
+                            ordered[index] = DeadlineMapResult::Pending(pending);
+                        }
+                    }
+                    result => ordered[index] = result,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    ordered
+}
+
 #[derive(Debug, Default)]
 pub struct CellPixelUpdate {
     pub resizes: Vec<(SurfaceId, (u16, u16), u64)>,
@@ -177,6 +490,22 @@ pub struct CellPixelUpdate {
 pub struct CellPixelUpdateFailure {
     pub surface: SurfaceId,
     pub error: String,
+    pub deferred: bool,
+}
+
+#[derive(Debug)]
+struct PendingCellPixelUpdate {
+    generation: u64,
+    target: (u16, u16),
+    failures: HashSet<SurfaceId>,
+    use_for_creation: bool,
+}
+
+struct CellPixelCompletionTracker {
+    generation: u64,
+    target: (u16, u16),
+    publishing: AtomicBool,
+    completed: Mutex<HashSet<SurfaceId>>,
 }
 
 /// Events pushed to subscribed frontends.
@@ -879,6 +1208,91 @@ impl ClientSizingState {
     }
 }
 
+#[cfg(test)]
+type CellPixelBeforePublishHook = Arc<dyn Fn((u16, u16)) + Send + Sync>;
+#[cfg(test)]
+type CellPixelOperationHook =
+    Arc<dyn Fn(&Arc<Surface>, (u16, u16), Instant) -> anyhow::Result<Option<u64>> + Send + Sync>;
+#[cfg(test)]
+type KittyImageBudgetOperationHook =
+    Arc<dyn Fn(&Arc<Surface>, KittyGraphicsLimits, Instant) -> anyhow::Result<()> + Send + Sync>;
+#[cfg(test)]
+type TerminalSpawnAfterCellPixelSnapshotHook = Arc<dyn Fn(bool) + Send + Sync>;
+
+type CellPixelSurfaceResult = (SurfaceId, (u16, u16), anyhow::Result<Option<u64>>, bool);
+
+struct PendingCellPixelOperation {
+    surface: Weak<Surface>,
+    result: DeadlinePending<CellPixelSurfaceResult>,
+}
+
+struct CellPixelRetryTask {
+    surfaces: Vec<Weak<Surface>>,
+    pending: Vec<PendingCellPixelOperation>,
+    attempts: u8,
+    generation: u64,
+    target: (u16, u16),
+    completion: Arc<CellPixelCompletionTracker>,
+    report: SurfaceResizeReporter,
+    timeout: Duration,
+    #[cfg(test)]
+    operation_hook: Option<CellPixelOperationHook>,
+}
+
+#[derive(Default)]
+struct CellPixelRetryQueue {
+    pending: Option<CellPixelRetryTask>,
+    worker_running: bool,
+}
+
+fn apply_cell_pixel_size_until(
+    surface: &Arc<Surface>,
+    target: (u16, u16),
+    deadline: Instant,
+    report: &SurfaceResizeReporter,
+    #[cfg(test)] operation_hook: Option<&CellPixelOperationHook>,
+) -> CellPixelSurfaceResult {
+    let id = surface.id;
+    let size = surface.size();
+    let callback = report.clone();
+    #[cfg(test)]
+    if let Some(hook) = operation_hook {
+        let result =
+            validate_cell_pixel_convergence(surface, target, hook(surface, target, deadline));
+        callback(id, size, result.as_ref().ok().copied().flatten());
+        let deferred = result.as_ref().err().is_some_and(|error| {
+            error.downcast_ref::<crate::terminal_host_runtime::DeferredCellPixelAck>().is_some()
+        });
+        return (id, size, result, deferred);
+    }
+    let result = validate_cell_pixel_convergence(
+        surface,
+        target,
+        surface.set_cell_pixel_size_reporting_until(
+            target.0,
+            target.1,
+            deadline,
+            Box::new(move |accepted| callback(id, size, accepted)),
+        ),
+    );
+    let deferred = result.as_ref().err().is_some_and(|error| {
+        error.downcast_ref::<crate::terminal_host_runtime::DeferredCellPixelAck>().is_some()
+    });
+    (id, size, result, deferred)
+}
+
+fn validate_cell_pixel_convergence(
+    surface: &Surface,
+    target: (u16, u16),
+    result: anyhow::Result<Option<u64>>,
+) -> anyhow::Result<Option<u64>> {
+    let reservation = result?;
+    if reservation.is_none() && surface.cell_pixel_size() != target {
+        anyhow::bail!("cell pixel update did not converge to {}x{} pixels", target.0, target.1);
+    }
+    Ok(reservation)
+}
+
 /// The multiplexer. Shared by frontends and the control socket server.
 pub struct Mux {
     /// Serializes durable workspace commits and their in-memory/event
@@ -915,9 +1329,27 @@ pub struct Mux {
     #[cfg(test)]
     terminal_create_after_workspace_reservation: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    terminal_spawn_after_cell_pixel_snapshot:
+        Mutex<Option<TerminalSpawnAfterCellPixelSnapshotHook>>,
+    #[cfg(test)]
     viewport_split_after_spawn: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     browser_runtime: Mutex<Option<Arc<BrowserRuntime>>>,
+    active_render_attachments: Arc<AtomicUsize>,
+    kitty_image_budget: Mutex<KittyImageBudgetState>,
+    kitty_image_budget_changed: std::sync::Condvar,
+    #[cfg(test)]
+    kitty_image_budget_operation: Mutex<Option<KittyImageBudgetOperationHook>>,
+    cell_pixel_lifecycle: Mutex<()>,
+    next_cell_pixel_generation: AtomicU64,
     cell_pixels: Mutex<(u16, u16)>,
+    pending_cell_pixels: Mutex<Option<PendingCellPixelUpdate>>,
+    cell_pixel_retries: Mutex<CellPixelRetryQueue>,
+    #[cfg(test)]
+    cell_pixel_before_publish: Mutex<Option<CellPixelBeforePublishHook>>,
+    #[cfg(test)]
+    cell_pixel_operation: Mutex<Option<CellPixelOperationHook>>,
+    #[cfg(test)]
+    cell_pixel_fanout_timeout: Mutex<Option<Duration>>,
     default_colors: Mutex<DefaultColors>,
     sidebar_plugin: Mutex<SidebarPluginRuntime>,
     agent_records: Mutex<HashMap<SurfaceId, AgentRecord>>,
@@ -1143,9 +1575,26 @@ impl Mux {
             #[cfg(test)]
             terminal_create_after_workspace_reservation: Mutex::new(None),
             #[cfg(test)]
+            terminal_spawn_after_cell_pixel_snapshot: Mutex::new(None),
+            #[cfg(test)]
             viewport_split_after_spawn: Mutex::new(None),
             browser_runtime: Mutex::new(None),
+            active_render_attachments: Arc::new(AtomicUsize::new(0)),
+            kitty_image_budget: Mutex::new(KittyImageBudgetState::default()),
+            kitty_image_budget_changed: std::sync::Condvar::new(),
+            #[cfg(test)]
+            kitty_image_budget_operation: Mutex::new(None),
+            cell_pixel_lifecycle: Mutex::new(()),
+            next_cell_pixel_generation: AtomicU64::new(1),
             cell_pixels: Mutex::new((8, 16)),
+            pending_cell_pixels: Mutex::new(None),
+            cell_pixel_retries: Mutex::new(CellPixelRetryQueue::default()),
+            #[cfg(test)]
+            cell_pixel_before_publish: Mutex::new(None),
+            #[cfg(test)]
+            cell_pixel_operation: Mutex::new(None),
+            #[cfg(test)]
+            cell_pixel_fanout_timeout: Mutex::new(None),
             default_colors: Mutex::new(DefaultColors::default()),
             sidebar_plugin: Mutex::new(SidebarPluginRuntime::default()),
             agent_records: Mutex::new(HashMap::new()),
@@ -2446,6 +2895,23 @@ impl Mux {
         let (cols, rows) = self.resolve_client_size(size, (opts.cols, opts.rows));
         opts.cols = cols;
         opts.rows = rows;
+        let cell_pixels = {
+            let cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+            let cell_pixels = self.cell_pixel_creation_size();
+            drop(cell_pixel_lifecycle);
+            cell_pixels
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.terminal_spawn_after_cell_pixel_snapshot.lock().unwrap().clone() {
+            let unlocked = match self.cell_pixel_lifecycle.try_lock() {
+                Ok(lifecycle) => {
+                    drop(lifecycle);
+                    true
+                }
+                Err(_) => false,
+            };
+            hook(unlocked);
+        }
         #[cfg(all(test, unix))]
         let use_host_runtime = !self.test_surface_runtime;
         #[cfg(all(not(test), unix))]
@@ -2503,11 +2969,12 @@ impl Mux {
             if reserve_replayed {
                 anyhow::bail!("terminal_create_replayed");
             }
-            let surface = match Surface::spawn_with_terminal_id(
+            let surface = match Surface::spawn_with_terminal_id_at_cell_pixels(
                 id,
                 opts,
                 Arc::downgrade(self),
                 Some(terminal_id),
+                cell_pixels,
             ) {
                 Ok(surface) => surface,
                 Err(error) => {
@@ -2540,7 +3007,7 @@ impl Mux {
                 surface.kill();
                 anyhow::bail!("terminal host changed registry-reserved identity");
             }
-            {
+            let ready_revision = {
                 let mut registry = self.workspace_registry.lock().unwrap();
                 let ready = commit_terminal_lifecycle(
                     &mut registry,
@@ -2559,23 +3026,47 @@ impl Mux {
                     }
                 };
                 self.emit_terminal_registry_changed(&registry, ready_revision);
-                if let Err(error) =
-                    insert_surface_checked(&mut self.state.lock().unwrap(), surface.clone())
-                {
-                    if let Ok((_, revision)) = commit_terminal_lifecycle(
-                        &mut registry,
-                        "terminal-exited",
-                        "terminal-surface-insert-failed",
-                        &terminal_hex,
-                        TerminalLifecycle::Exited,
-                        Some(&identity.incarnation),
-                        Some(serde_json::json!({"reason":"surface-insert-failed"})),
-                    ) {
-                        self.emit_terminal_registry_changed(&registry, revision);
+                ready_revision
+            };
+            let cell_pixel_lifecycle =
+                match self.reconcile_surface_cell_pixels_for_publish(&surface) {
+                    Ok(lifecycle) => lifecycle,
+                    Err(error) => {
+                        let _ = self.transition_terminal_lifecycle(
+                            "terminal-exited",
+                            "terminal-cell-pixel-reconcile-failed",
+                            &terminal_hex,
+                            TerminalLifecycle::Exited,
+                            Some(&identity.incarnation),
+                            Some(serde_json::json!({
+                                "reason":"cell-pixel-reconcile-failed",
+                                "error":error.to_string(),
+                                "ready_revision":ready_revision,
+                            })),
+                        );
+                        surface.kill();
+                        return Err(error);
                     }
-                    surface.kill();
-                    return Err(error);
+                };
+            let insert_result =
+                insert_surface_checked(&mut self.state.lock().unwrap(), surface.clone());
+            drop(cell_pixel_lifecycle);
+            if let Err(error) = insert_result {
+                let mut registry = self.workspace_registry.lock().unwrap();
+                if let Ok((_, revision)) = commit_terminal_lifecycle(
+                    &mut registry,
+                    "terminal-exited",
+                    "terminal-surface-insert-failed",
+                    &terminal_hex,
+                    TerminalLifecycle::Exited,
+                    Some(&identity.incarnation),
+                    Some(serde_json::json!({"reason":"surface-insert-failed"})),
+                ) {
+                    self.emit_terminal_registry_changed(&registry, revision);
                 }
+                drop(registry);
+                surface.kill();
+                return Err(error);
             }
             // Deprecated recovery mirror only; SQLite is placement authority.
             let _ = surface.persist_host_workspace(workspace_key);
@@ -2586,12 +3077,13 @@ impl Mux {
         }
         #[cfg(test)]
         let surface_result = if self.test_surface_runtime {
-            Surface::spawn_for_test(id, opts, Arc::downgrade(self))
+            Surface::spawn_for_test_at_cell_pixels(id, opts, Arc::downgrade(self), cell_pixels)
         } else {
-            Surface::spawn(id, opts, Arc::downgrade(self))
+            Surface::spawn_at_cell_pixels(id, opts, Arc::downgrade(self), cell_pixels)
         };
         #[cfg(not(test))]
-        let surface_result = Surface::spawn(id, opts, Arc::downgrade(self));
+        let surface_result =
+            Surface::spawn_at_cell_pixels(id, opts, Arc::downgrade(self), cell_pixels);
         let surface = match surface_result {
             Ok(surface) => surface,
             Err(error) => {
@@ -2599,8 +3091,18 @@ impl Mux {
                 return Err(error);
             }
         };
-        if let Err(error) = insert_surface_checked(&mut self.state.lock().unwrap(), surface.clone())
-        {
+        let cell_pixel_lifecycle = match self.reconcile_surface_cell_pixels_for_publish(&surface) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                self.pending_workspace_surfaces.lock().unwrap().remove(&id);
+                surface.kill();
+                return Err(error);
+            }
+        };
+        let insert_result =
+            insert_surface_checked(&mut self.state.lock().unwrap(), surface.clone());
+        drop(cell_pixel_lifecycle);
+        if let Err(error) = insert_result {
             self.pending_workspace_surfaces.lock().unwrap().remove(&id);
             surface.kill();
             return Err(error);
@@ -2623,15 +3125,34 @@ impl Mux {
         opts.cols = size.0.max(1);
         opts.rows = size.1.max(1);
         opts.extra_env.push(("CMUX_SIDEBAR".to_string(), "1".to_string()));
+        let cell_pixels = {
+            let cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+            let cell_pixels = self.cell_pixel_creation_size();
+            drop(cell_pixel_lifecycle);
+            cell_pixels
+        };
         #[cfg(test)]
         let surface = if self.test_surface_runtime {
-            Surface::spawn_for_test(id, opts, Arc::downgrade(self))?
+            Surface::spawn_for_test_at_cell_pixels(id, opts, Arc::downgrade(self), cell_pixels)?
         } else {
-            Surface::spawn(id, opts, Arc::downgrade(self))?
+            Surface::spawn_at_cell_pixels(id, opts, Arc::downgrade(self), cell_pixels)?
         };
         #[cfg(not(test))]
-        let surface = Surface::spawn(id, opts, Arc::downgrade(self))?;
-        insert_surface_checked(&mut self.state.lock().unwrap(), surface.clone())?;
+        let surface = Surface::spawn_at_cell_pixels(id, opts, Arc::downgrade(self), cell_pixels)?;
+        let cell_pixel_lifecycle = match self.reconcile_surface_cell_pixels_for_publish(&surface) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                surface.kill();
+                return Err(error);
+            }
+        };
+        let insert_result =
+            insert_surface_checked(&mut self.state.lock().unwrap(), surface.clone());
+        drop(cell_pixel_lifecycle);
+        if let Err(error) = insert_result {
+            surface.kill();
+            return Err(error);
+        }
         Ok(surface)
     }
 
@@ -2641,13 +3162,14 @@ impl Mux {
         size: Option<(u16, u16)>,
         pending_workspace: Option<WorkspaceId>,
     ) -> Arc<Surface> {
+        let _cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
         let id = self.next_id();
         if let Some(workspace) = pending_workspace {
             self.pending_workspace_surfaces.lock().unwrap().insert(id, workspace);
         }
         let opts = self.surface_options.lock().unwrap().clone();
         let size = self.resolve_client_size(size, (opts.cols, opts.rows));
-        let cell_pixels = *self.cell_pixels.lock().unwrap();
+        let cell_pixels = self.cell_pixel_creation_size();
         let surface =
             browser::new_surface(id, url.clone(), size, cell_pixels, &opts, Arc::downgrade(self));
         self.state.lock().unwrap().surfaces.insert(id, surface.clone());
@@ -3805,6 +4327,18 @@ impl Mux {
     fn purge_surface_side_tables(&self, surface: SurfaceId) {
         self.agent_records.lock().unwrap().remove(&surface);
         self.surface_notifications.lock().unwrap().remove(&surface);
+        {
+            let _cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+            let mut pending = self.pending_cell_pixels.lock().unwrap();
+            if let Some(update) = pending.as_mut() {
+                update.failures.remove(&surface);
+                if update.failures.is_empty() {
+                    let target = update.target;
+                    *self.cell_pixels.lock().unwrap() = target;
+                    *pending = None;
+                }
+            }
+        }
         let _lifecycle = self.lock_client_sizing_lifecycle();
         let mut sizing = self.client_sizing.lock().unwrap();
         sizing.surfaces.remove(&surface);
@@ -3953,7 +4487,7 @@ impl Mux {
         }
     }
 
-    pub fn set_cell_pixel_size(&self, width_px: u16, height_px: u16) -> CellPixelUpdate {
+    pub fn set_cell_pixel_size(self: &Arc<Self>, width_px: u16, height_px: u16) -> CellPixelUpdate {
         self.set_cell_pixel_size_reporting(width_px, height_px, Arc::new(|_, _, _| {}))
     }
 
@@ -3961,35 +4495,1003 @@ impl Mux {
         *self.cell_pixels.lock().unwrap()
     }
 
-    pub fn set_cell_pixel_size_reporting(
+    pub(crate) fn claim_render_attachment(&self) -> Option<RenderAttachmentPermit> {
+        self.active_render_attachments
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < RENDER_ATTACHMENT_LIMIT).then_some(active + 1)
+            })
+            .ok()?;
+        Some(RenderAttachmentPermit { active: self.active_render_attachments.clone() })
+    }
+
+    pub(crate) fn reserve_kitty_image_surface(
+        self: &Arc<Self>,
+        surface: SurfaceId,
+    ) -> anyhow::Result<KittyImageBudgetReservation> {
+        {
+            let mut budget = self.kitty_image_budget.lock().unwrap();
+            Self::prune_dead_kitty_image_surfaces(&mut budget);
+            anyhow::ensure!(
+                budget.blocked_surfaces.is_empty(),
+                "Kitty image quota updates are blocked after a terminal rejected the previous \
+                 limit update"
+            );
+            anyhow::ensure!(
+                !budget.entries.contains_key(&surface),
+                "Kitty image budget already reserved for surface {surface}"
+            );
+            let owner_count = Self::kitty_image_budget_owner_count(&budget);
+            let owns_quota = owner_count < KITTY_IMAGE_BUDGET_OWNER_LIMIT;
+            if owns_quota {
+                budget.capacity = kitty_image_budget_capacity(owner_count + 1, budget.capacity);
+            }
+            budget.entries.insert(
+                surface,
+                KittyImageBudgetEntry {
+                    surface: None,
+                    applied: KittyGraphicsLimits::disabled(),
+                    owns_quota,
+                    removing: false,
+                },
+            );
+        }
+        self.start_kitty_image_budget_worker();
+        let deadline = Instant::now() + crate::terminal_host_runtime::CONTROL_RESPONSE_TIMEOUT;
+        let initial_limits = loop {
+            let mut budget = self.kitty_image_budget.lock().unwrap();
+            if !budget.blocked_surfaces.is_empty() {
+                drop(budget);
+                self.cancel_kitty_image_surface_reservation(surface);
+                anyhow::bail!(
+                    "Kitty image quota updates are blocked after a terminal rejected the \
+                     previous limit update"
+                );
+            }
+            let owns_quota = budget
+                .entries
+                .get(&surface)
+                .ok_or_else(|| anyhow::anyhow!("Kitty image budget reservation disappeared"))?
+                .owns_quota;
+            if !owns_quota {
+                break KittyGraphicsLimits::disabled();
+            }
+            let target = kitty_image_limits_for_capacity(budget.capacity);
+            if !budget.expansion_in_flight
+                && kitty_image_limits_enabled(target)
+                && budget.entries.iter().all(|(&id, entry)| {
+                    id == surface || kitty_image_limits_within(entry.applied, target)
+                })
+            {
+                let entry = budget
+                    .entries
+                    .get_mut(&surface)
+                    .ok_or_else(|| anyhow::anyhow!("Kitty image budget reservation disappeared"))?;
+                entry.applied = target;
+                break target;
+            }
+            if self.shutting_down.load(Ordering::Acquire) {
+                drop(budget);
+                self.cancel_kitty_image_surface_reservation(surface);
+                anyhow::bail!("multiplexer shut down while reserving Kitty image quota");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(budget);
+                self.cancel_kitty_image_surface_reservation(surface);
+                anyhow::bail!(
+                    "timed out waiting for existing terminals to release Kitty image quota"
+                );
+            }
+            let (next, _) =
+                self.kitty_image_budget_changed.wait_timeout(budget, remaining).unwrap();
+            drop(next);
+        };
+        Ok(KittyImageBudgetReservation {
+            mux: Arc::downgrade(self),
+            surface,
+            initial_limits,
+            committed: false,
+        })
+    }
+
+    fn commit_kitty_image_surface(
+        self: &Arc<Self>,
+        id: SurfaceId,
+        surface: &Arc<Surface>,
+        applied: KittyGraphicsLimits,
+    ) -> anyhow::Result<()> {
+        {
+            let mut budget = self.kitty_image_budget.lock().unwrap();
+            let entry = budget
+                .entries
+                .get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("Kitty image budget reservation disappeared"))?;
+            anyhow::ensure!(
+                entry.surface.is_none() && !entry.removing,
+                "Kitty image budget reservation is no longer pending"
+            );
+            entry.surface = Some(Arc::downgrade(surface));
+            entry.applied = applied;
+            Self::rebalance_kitty_image_budget_owners(&mut budget);
+        }
+        self.start_kitty_image_budget_worker();
+        Ok(())
+    }
+
+    fn cancel_kitty_image_surface_reservation(self: &Arc<Self>, id: SurfaceId) {
+        {
+            let mut budget = self.kitty_image_budget.lock().unwrap();
+            if budget.entries.get(&id).is_some_and(|entry| entry.surface.is_none()) {
+                budget.entries.remove(&id);
+                Self::rebalance_kitty_image_budget_owners(&mut budget);
+            }
+        }
+        self.kitty_image_budget_changed.notify_all();
+        self.start_kitty_image_budget_worker();
+    }
+
+    pub(crate) fn unregister_kitty_image_surface(
+        self: &Arc<Self>,
+        surface: &Surface,
+    ) -> anyhow::Result<()> {
+        {
+            let mut budget = self.kitty_image_budget.lock().unwrap();
+            if let Some(entry) = budget.entries.get_mut(&surface.id) {
+                entry.removing = true;
+            }
+            budget.blocked_surfaces.remove(&surface.id);
+        }
+        self.start_kitty_image_budget_worker();
+        Ok(())
+    }
+
+    fn prune_dead_kitty_image_surfaces(budget: &mut KittyImageBudgetState) {
+        budget.entries.retain(|_, entry| {
+            entry.surface.as_ref().is_none_or(|surface| surface.strong_count() > 0)
+        });
+        let live_ids = budget.entries.keys().copied().collect::<HashSet<_>>();
+        budget.blocked_surfaces.retain(|id| live_ids.contains(id));
+        Self::rebalance_kitty_image_budget_owners(budget);
+    }
+
+    fn kitty_image_budget_owner_count(budget: &KittyImageBudgetState) -> usize {
+        budget.entries.values().filter(|entry| entry.owns_quota).count()
+    }
+
+    fn rebalance_kitty_image_budget_owners(budget: &mut KittyImageBudgetState) {
+        let owner_count = Self::kitty_image_budget_owner_count(budget);
+        debug_assert!(owner_count <= KITTY_IMAGE_BUDGET_OWNER_LIMIT);
+        let available = KITTY_IMAGE_BUDGET_OWNER_LIMIT.saturating_sub(owner_count);
+        if available > 0 && owner_count < budget.entries.len() {
+            let mut candidates = budget
+                .entries
+                .iter()
+                .filter_map(|(&id, entry)| {
+                    (!entry.owns_quota
+                        && !entry.removing
+                        && entry.surface.as_ref().is_some_and(|surface| surface.strong_count() > 0))
+                    .then_some(id)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_unstable();
+            for id in candidates.into_iter().take(available) {
+                if let Some(entry) = budget.entries.get_mut(&id) {
+                    entry.owns_quota = true;
+                }
+            }
+        }
+        budget.capacity = kitty_image_budget_capacity(
+            Self::kitty_image_budget_owner_count(budget),
+            budget.capacity,
+        );
+    }
+
+    fn start_kitty_image_budget_worker(self: &Arc<Self>) {
+        let should_start = {
+            let mut budget = self.kitty_image_budget.lock().unwrap();
+            Self::prune_dead_kitty_image_surfaces(&mut budget);
+            let target = kitty_image_limits_for_capacity(budget.capacity);
+            let has_work = budget.entries.values().any(|entry| {
+                entry.surface.as_ref().is_some_and(|surface| surface.strong_count() > 0)
+                    && entry.applied
+                        != if entry.removing || !entry.owns_quota {
+                            KittyGraphicsLimits::disabled()
+                        } else {
+                            target
+                        }
+            });
+            if budget.worker_running || !budget.blocked_surfaces.is_empty() || !has_work {
+                false
+            } else {
+                budget.worker_running = true;
+                true
+            }
+        };
+        if !should_start {
+            return;
+        }
+        let mux = Arc::downgrade(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("kitty-image-budget".into())
+            .spawn(move || Self::run_kitty_image_budget_worker(mux))
+        {
+            self.kitty_image_budget.lock().unwrap().worker_running = false;
+            self.emit(MuxEvent::Status(format!(
+                "failed to start Kitty image budget worker: {error}"
+            )));
+        }
+    }
+
+    fn run_kitty_image_budget_worker(mux: Weak<Self>) {
+        let mut failure_streak = 0_u32;
+        let mut pending_operations = Vec::<PendingKittyImageBudgetOperation>::new();
+        loop {
+            let Some(mux) = mux.upgrade() else { return };
+            if mux.shutting_down.load(Ordering::Acquire) {
+                let mut budget = mux.kitty_image_budget.lock().unwrap();
+                budget.expansion_in_flight = false;
+                budget.worker_running = false;
+                return;
+            }
+
+            let mut failures = Vec::new();
+            let mut failed_operations = HashSet::new();
+            let mut failed_surface_ids = HashSet::new();
+            let mut retained_pending = Vec::new();
+            let mut pending_completed = false;
+            {
+                let mut budget = mux.kitty_image_budget.lock().unwrap();
+                for pending in pending_operations.drain(..) {
+                    let Some(result) = pending.result.try_take() else {
+                        retained_pending.push(pending);
+                        continue;
+                    };
+                    pending_completed = true;
+                    match result {
+                        Ok(()) => {
+                            if let Some(entry) = budget.entries.get_mut(&pending.surface_id)
+                                && entry
+                                    .surface
+                                    .as_ref()
+                                    .and_then(Weak::upgrade)
+                                    .zip(pending.surface.upgrade())
+                                    .is_some_and(|(registered, completed)| {
+                                        Arc::ptr_eq(&registered, &completed)
+                                    })
+                            {
+                                entry.applied = pending.limits;
+                            }
+                        }
+                        Err(error) => {
+                            failed_operations.insert(pending.surface_id);
+                            failed_surface_ids.insert(pending.surface_id);
+                            failures.push(format!("surface {}: {error}", pending.surface_id));
+                        }
+                    }
+                }
+                budget.expansion_in_flight =
+                    retained_pending.iter().any(|pending| pending.expanding);
+            }
+            pending_operations = retained_pending;
+            if pending_completed {
+                mux.kitty_image_budget_changed.notify_all();
+            }
+
+            let pending_ids =
+                pending_operations.iter().map(|pending| pending.surface_id).collect::<HashSet<_>>();
+            let tasks = {
+                let mut budget = mux.kitty_image_budget.lock().unwrap();
+                Self::prune_dead_kitty_image_surfaces(&mut budget);
+                let target = kitty_image_limits_for_capacity(budget.capacity);
+                let mut tasks = Vec::new();
+                for (&id, entry) in &budget.entries {
+                    if pending_ids.contains(&id) || failed_operations.contains(&id) {
+                        continue;
+                    }
+                    let Some(surface) = entry.surface.as_ref().and_then(Weak::upgrade) else {
+                        continue;
+                    };
+                    let desired = if entry.removing || !entry.owns_quota {
+                        KittyGraphicsLimits::disabled()
+                    } else {
+                        target
+                    };
+                    if entry.applied != desired
+                        && (entry.removing
+                            || !entry.owns_quota
+                            || kitty_image_limits_exceed(entry.applied, desired))
+                    {
+                        tasks.push((id, surface, desired, false));
+                    }
+                }
+                if tasks.is_empty() {
+                    budget.entries.retain(|id, entry| {
+                        pending_ids.contains(id)
+                            || !(entry.removing
+                                && (entry.surface.is_none()
+                                    || entry.applied == KittyGraphicsLimits::disabled()))
+                    });
+                    let previous_capacity = budget.capacity;
+                    Self::rebalance_kitty_image_budget_owners(&mut budget);
+                    if budget.capacity != previous_capacity {
+                        continue;
+                    }
+                    let target = kitty_image_limits_for_capacity(budget.capacity);
+                    for (&id, entry) in &budget.entries {
+                        if pending_ids.contains(&id) || failed_operations.contains(&id) {
+                            continue;
+                        }
+                        let Some(surface) = entry.surface.as_ref().and_then(Weak::upgrade) else {
+                            continue;
+                        };
+                        if entry.owns_quota && !entry.removing && entry.applied != target {
+                            tasks.push((
+                                id,
+                                surface,
+                                target,
+                                kitty_image_limits_exceed(target, entry.applied),
+                            ));
+                        }
+                    }
+                }
+                budget.expansion_in_flight =
+                    pending_operations.iter().any(|pending| pending.expanding)
+                        || tasks.iter().any(|task| task.3);
+                if tasks.is_empty() && pending_operations.is_empty() && failed_operations.is_empty()
+                {
+                    budget.expansion_in_flight = false;
+                    budget.worker_running = false;
+                    return;
+                }
+                tasks
+            };
+
+            let mut deferred = 0_usize;
+            if !tasks.is_empty() {
+                let deadline =
+                    Instant::now() + crate::terminal_host_runtime::CONTROL_RESPONSE_TIMEOUT;
+                let operation_mux = Arc::downgrade(&mux);
+                let results = bounded_deadline_map(
+                    &tasks,
+                    deadline,
+                    move |(_, surface, limits, _), deadline| {
+                        let Some(mux) = operation_mux.upgrade() else {
+                            anyhow::bail!("multiplexer shut down before Kitty quota update");
+                        };
+                        mux.apply_kitty_image_limits(surface, *limits, deadline)
+                    },
+                );
+                let mut budget = mux.kitty_image_budget.lock().unwrap();
+                for ((id, surface, limits, expanding), result) in tasks.iter().zip(results) {
+                    match result {
+                        DeadlineMapResult::Complete(Ok(())) => {
+                            if let Some(entry) = budget.entries.get_mut(id)
+                                && entry
+                                    .surface
+                                    .as_ref()
+                                    .and_then(Weak::upgrade)
+                                    .is_some_and(|registered| Arc::ptr_eq(&registered, surface))
+                            {
+                                entry.applied = *limits;
+                            }
+                        }
+                        DeadlineMapResult::Complete(Err(error)) => {
+                            failed_surface_ids.insert(*id);
+                            failures.push(format!("surface {id}: {error}"));
+                        }
+                        DeadlineMapResult::Pending(result) => {
+                            pending_operations.push(PendingKittyImageBudgetOperation {
+                                surface_id: *id,
+                                surface: Arc::downgrade(surface),
+                                limits: *limits,
+                                expanding: *expanding,
+                                result,
+                            });
+                        }
+                        DeadlineMapResult::Unscheduled => {
+                            deferred += 1;
+                        }
+                    }
+                }
+                budget.expansion_in_flight =
+                    pending_operations.iter().any(|pending| pending.expanding);
+            }
+            for pending in &pending_operations {
+                if failed_surface_ids.insert(pending.surface_id) {
+                    failures.push(format!(
+                        "surface {}: update did not complete before its deadline",
+                        pending.surface_id
+                    ));
+                }
+            }
+            mux.kitty_image_budget_changed.notify_all();
+            if failures.is_empty() {
+                failure_streak = 0;
+                if deferred > 0 || !pending_operations.is_empty() {
+                    std::thread::sleep(KITTY_IMAGE_BUDGET_RETRY_INITIAL);
+                }
+                continue;
+            }
+
+            failure_streak = failure_streak.saturating_add(1);
+            let retry_exhausted = failure_streak >= KITTY_IMAGE_BUDGET_RETRY_MAX_ATTEMPTS;
+            if failure_streak == 1 || failure_streak.is_power_of_two() || retry_exhausted {
+                let omitted = failures.len().saturating_sub(8);
+                let mut summary = failures.into_iter().take(8).collect::<Vec<_>>().join("; ");
+                if omitted > 0 {
+                    summary.push_str(&format!("; {omitted} more"));
+                }
+                let action =
+                    if retry_exhausted { "stopped after exhausting retries" } else { "retrying" };
+                mux.emit(MuxEvent::Status(format!(
+                    "Kitty image budget update failed, {action}: {summary}"
+                )));
+            }
+            if retry_exhausted {
+                let mut budget = mux.kitty_image_budget.lock().unwrap();
+                let blocked = failed_surface_ids
+                    .into_iter()
+                    .filter(|id| budget.entries.contains_key(id))
+                    .collect::<Vec<_>>();
+                budget.blocked_surfaces.extend(blocked);
+                budget.expansion_in_flight = false;
+                budget.worker_running = false;
+                drop(budget);
+                mux.kitty_image_budget_changed.notify_all();
+                return;
+            }
+            let multiplier =
+                1_u32.checked_shl(failure_streak.saturating_sub(1).min(16)).unwrap_or(u32::MAX);
+            let delay = KITTY_IMAGE_BUDGET_RETRY_INITIAL
+                .saturating_mul(multiplier)
+                .min(KITTY_IMAGE_BUDGET_RETRY_MAX);
+            drop(mux);
+            std::thread::sleep(delay);
+        }
+    }
+
+    fn apply_kitty_image_limits(
         &self,
+        surface: &Arc<Surface>,
+        limits: KittyGraphicsLimits,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(operation) = self.kitty_image_budget_operation.lock().unwrap().clone() {
+            return operation(surface, limits, deadline);
+        }
+        surface.set_kitty_graphics_limits_until(limits, deadline)
+    }
+
+    #[cfg(test)]
+    fn kitty_image_budget_idle_for_test(&self) -> bool {
+        let budget = self.kitty_image_budget.lock().unwrap();
+        let target = kitty_image_limits_for_capacity(budget.capacity);
+        !budget.worker_running
+            && budget.entries.values().all(|entry| {
+                entry.surface.is_some()
+                    && !entry.removing
+                    && entry.applied
+                        == if entry.owns_quota { target } else { KittyGraphicsLimits::disabled() }
+            })
+    }
+
+    pub(crate) fn cell_pixel_creation_size(&self) -> (u16, u16) {
+        if let Some(target) = self
+            .pending_cell_pixels
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|pending| pending.use_for_creation)
+            .map(|pending| pending.target)
+        {
+            return target;
+        }
+        self.cell_pixel_size()
+    }
+
+    fn reconcile_surface_cell_pixels_for_publish<'a>(
+        &'a self,
+        surface: &Arc<Surface>,
+    ) -> anyhow::Result<MutexGuard<'a, ()>> {
+        loop {
+            let lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+            let target = self.cell_pixel_creation_size();
+            if surface.cell_pixel_size() == target {
+                return Ok(lifecycle);
+            }
+            drop(lifecycle);
+            validate_cell_pixel_convergence(
+                surface,
+                target,
+                surface.set_cell_pixel_size_reporting_until(
+                    target.0,
+                    target.1,
+                    Instant::now() + crate::terminal_host_runtime::CONTROL_RESPONSE_TIMEOUT,
+                    Box::new(|_| {}),
+                ),
+            )?;
+        }
+    }
+
+    pub(crate) fn reconcile_deferred_cell_pixel_ack(&self, surface: SurfaceId, target: (u16, u16)) {
+        let _cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+        self.reconcile_cell_pixel_ack_locked(surface, target);
+    }
+
+    fn reconcile_cell_pixel_ack_locked(&self, surface: SurfaceId, target: (u16, u16)) {
+        let mut pending = self.pending_cell_pixels.lock().unwrap();
+        let Some(update) = pending.as_mut().filter(|update| update.target == target) else {
+            return;
+        };
+        update.failures.remove(&surface);
+        if !update.failures.is_empty() {
+            return;
+        }
+        *self.cell_pixels.lock().unwrap() = target;
+        *pending = None;
+    }
+
+    fn reconcile_cell_pixel_completion_locked(
+        &self,
+        surface: SurfaceId,
+        generation: u64,
+        target: (u16, u16),
+    ) {
+        let mut pending = self.pending_cell_pixels.lock().unwrap();
+        let Some(update) = pending
+            .as_mut()
+            .filter(|update| update.generation == generation && update.target == target)
+        else {
+            return;
+        };
+        update.failures.remove(&surface);
+        if !update.failures.is_empty() {
+            return;
+        }
+        *self.cell_pixels.lock().unwrap() = target;
+        *pending = None;
+    }
+
+    fn record_cell_pixel_completion(
+        self: &Arc<Self>,
+        completion: &Arc<CellPixelCompletionTracker>,
+        surface: SurfaceId,
+    ) {
+        completion.completed.lock().unwrap().insert(surface);
+        if completion.publishing.load(Ordering::Acquire) {
+            return;
+        }
+        let _lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+        if completion.completed.lock().unwrap().remove(&surface) {
+            self.reconcile_cell_pixel_completion_locked(
+                surface,
+                completion.generation,
+                completion.target,
+            );
+        }
+    }
+
+    fn enqueue_cell_pixel_retries(
+        self: &Arc<Self>,
+        task: CellPixelRetryTask,
+    ) -> std::io::Result<()> {
+        let mut retries = self.cell_pixel_retries.lock().unwrap();
+        if retries.pending.as_ref().is_some_and(|pending| pending.generation > task.generation) {
+            return Ok(());
+        }
+        retries.pending = Some(task);
+        if retries.worker_running {
+            return Ok(());
+        }
+        retries.worker_running = true;
+        let mux = Arc::downgrade(self);
+        match std::thread::Builder::new()
+            .name("cell-pixel-retry".to_string())
+            .spawn(move || Self::run_cell_pixel_retry_worker(mux))
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                retries.worker_running = false;
+                retries.pending = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn run_cell_pixel_retry_worker(mux: Weak<Self>) {
+        loop {
+            let task = {
+                let Some(mux) = mux.upgrade() else { return };
+                let mut retries = mux.cell_pixel_retries.lock().unwrap();
+                if mux.shutting_down.load(Ordering::Acquire) {
+                    retries.pending = None;
+                    retries.worker_running = false;
+                    return;
+                }
+                match retries.pending.take() {
+                    Some(task) => task,
+                    None => {
+                        retries.worker_running = false;
+                        return;
+                    }
+                }
+            };
+            if let Some(mut task) = Self::run_cell_pixel_retry_task(&mux, task) {
+                task.attempts = task.attempts.saturating_add(1);
+                if task.attempts >= CELL_PIXEL_RETRY_MAX_ATTEMPTS {
+                    if let Some(mux) = mux.upgrade() {
+                        mux.finish_cell_pixel_retries(&task);
+                    }
+                    continue;
+                }
+                std::thread::sleep(cell_pixel_retry_delay(task.attempts));
+                let Some(mux) = mux.upgrade() else { return };
+                let mut retries = mux.cell_pixel_retries.lock().unwrap();
+                if retries.pending.is_none() {
+                    retries.pending = Some(task);
+                }
+            }
+        }
+    }
+
+    fn finish_cell_pixel_retries(&self, task: &CellPixelRetryTask) {
+        let remaining = {
+            let _cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+            let mut pending = self.pending_cell_pixels.lock().unwrap();
+            let Some(pending) = pending.as_mut().filter(|pending| {
+                pending.generation == task.generation && pending.target == task.target
+            }) else {
+                return;
+            };
+            pending.use_for_creation = false;
+            pending.failures.len()
+        };
+        self.emit(MuxEvent::Status(format!(
+            "cell pixel update stopped after {} retry attempts with {remaining} unconverged \
+             surface(s) at {}x{}; a later host acknowledgement can still recover",
+            task.attempts, task.target.0, task.target.1
+        )));
+    }
+
+    fn run_cell_pixel_retry_task(
+        mux: &Weak<Self>,
+        task: CellPixelRetryTask,
+    ) -> Option<CellPixelRetryTask> {
+        let mut retry_candidates = task.surfaces;
+        let mut pending_operations = Vec::new();
+        for pending in task.pending {
+            let Some(result) = pending.result.try_take() else {
+                pending_operations.push(pending);
+                continue;
+            };
+            let mux = mux.upgrade()?;
+            let _cell_pixel_lifecycle = mux.cell_pixel_lifecycle.lock().unwrap();
+            if !mux.pending_cell_pixels.lock().unwrap().as_ref().is_some_and(|update| {
+                update.generation == task.generation && update.target == task.target
+            }) {
+                return None;
+            }
+            let (surface_id, _, result, deferred) = result;
+            match result {
+                Ok(_) => mux.reconcile_cell_pixel_completion_locked(
+                    surface_id,
+                    task.generation,
+                    task.target,
+                ),
+                Err(_) if deferred => {}
+                Err(_) => retry_candidates.push(pending.surface),
+            }
+        }
+        let mut unique = HashSet::new();
+        retry_candidates
+            .retain(|surface| surface.upgrade().is_some_and(|surface| unique.insert(surface.id)));
+        let mut remaining = Vec::new();
+        for retry_wave in retry_candidates.chunks(CELL_PIXEL_FANOUT_MAX_WORKERS) {
+            let mux = mux.upgrade()?;
+            let active = {
+                let _cell_pixel_lifecycle = mux.cell_pixel_lifecycle.lock().unwrap();
+                let pending = mux.pending_cell_pixels.lock().unwrap();
+                let pending = pending.as_ref().filter(|pending| {
+                    pending.generation == task.generation
+                        && pending.target == task.target
+                        && !pending.failures.is_empty()
+                })?;
+                retry_wave
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .filter(|surface| pending.failures.contains(&surface.id))
+                    .collect::<Vec<_>>()
+            };
+            let deadline = Instant::now() + task.timeout;
+            let report = task.report.clone();
+            #[cfg(test)]
+            let operation_hook = task.operation_hook.clone();
+            let target = task.target;
+            let completion = task.completion.clone();
+            let completion_mux = Arc::downgrade(&mux);
+            let results = bounded_deadline_map(&active, deadline, move |surface, deadline| {
+                let result = apply_cell_pixel_size_until(
+                    surface,
+                    target,
+                    deadline,
+                    &report,
+                    #[cfg(test)]
+                    operation_hook.as_ref(),
+                );
+                if result.2.is_ok()
+                    && let Some(mux) = completion_mux.upgrade()
+                {
+                    mux.record_cell_pixel_completion(&completion, surface.id);
+                }
+                result
+            });
+            let _cell_pixel_lifecycle = mux.cell_pixel_lifecycle.lock().unwrap();
+            if !mux.pending_cell_pixels.lock().unwrap().as_ref().is_some_and(|pending| {
+                pending.generation == task.generation && pending.target == task.target
+            }) {
+                return None;
+            }
+            for (surface, result) in active.iter().zip(results) {
+                let (surface_id, result, deferred) = match result {
+                    DeadlineMapResult::Complete((surface_id, _, result, deferred)) => {
+                        (surface_id, Some(result), deferred)
+                    }
+                    DeadlineMapResult::Pending(result) => {
+                        pending_operations.push(PendingCellPixelOperation {
+                            surface: Arc::downgrade(surface),
+                            result,
+                        });
+                        continue;
+                    }
+                    DeadlineMapResult::Unscheduled => {
+                        remaining.push(Arc::downgrade(surface));
+                        continue;
+                    }
+                };
+                match result.expect("complete deadline result has an operation result") {
+                    Ok(_) => mux.reconcile_cell_pixel_completion_locked(
+                        surface_id,
+                        task.generation,
+                        task.target,
+                    ),
+                    Err(_) if deferred => {}
+                    Err(error)
+                        if error
+                            .downcast_ref::<
+                                crate::terminal_host_runtime::CellPixelRequestDeadlineElapsed,
+                            >()
+                            .is_some() =>
+                    {
+                        remaining.push(Arc::downgrade(surface));
+                    }
+                    Err(_) => {
+                        if let Some(pending) = mux
+                            .pending_cell_pixels
+                            .lock()
+                            .unwrap()
+                            .as_mut()
+                            .filter(|pending| {
+                                pending.generation == task.generation
+                                    && pending.target == task.target
+                            })
+                        {
+                            pending.use_for_creation = false;
+                        }
+                    }
+                }
+            }
+        }
+        let pending_ids = pending_operations
+            .iter()
+            .filter_map(|pending| pending.surface.upgrade())
+            .map(|surface| surface.id)
+            .collect::<HashSet<_>>();
+        let mut unique = HashSet::new();
+        remaining.retain(|surface| {
+            surface.upgrade().is_some_and(|surface| {
+                !pending_ids.contains(&surface.id) && unique.insert(surface.id)
+            })
+        });
+        (!remaining.is_empty() || !pending_operations.is_empty()).then_some(CellPixelRetryTask {
+            surfaces: remaining,
+            pending: pending_operations,
+            attempts: task.attempts,
+            generation: task.generation,
+            target: task.target,
+            completion: task.completion,
+            report: task.report,
+            timeout: task.timeout,
+            #[cfg(test)]
+            operation_hook: task.operation_hook,
+        })
+    }
+
+    pub fn set_cell_pixel_size_reporting(
+        self: &Arc<Self>,
         width_px: u16,
         height_px: u16,
         report: SurfaceResizeReporter,
     ) -> CellPixelUpdate {
+        let cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
+        let generation = self.next_cell_pixel_generation.fetch_add(1, Ordering::Relaxed);
         let next = (width_px.max(1), height_px.max(1));
-        // This is the desired global metric used for new browser surfaces.
-        // Existing surfaces still check their settled geometry on every call,
-        // so a rejected queue submission can be retried with the same value.
-        *self.cell_pixels.lock().unwrap() = next;
-        let surfaces = self.state.lock().unwrap().surfaces.values().cloned().collect::<Vec<_>>();
+        let completion = Arc::new(CellPixelCompletionTracker {
+            generation,
+            target: next,
+            publishing: AtomicBool::new(true),
+            completed: Mutex::new(HashSet::new()),
+        });
+        let mut surfaces =
+            self.state.lock().unwrap().surfaces.values().cloned().collect::<Vec<_>>();
+        surfaces.sort_unstable_by_key(|surface| surface.id);
+        #[cfg(test)]
+        let timeout = self
+            .cell_pixel_fanout_timeout
+            .lock()
+            .unwrap()
+            .unwrap_or(crate::terminal_host_runtime::CONTROL_RESPONSE_TIMEOUT);
+        #[cfg(not(test))]
+        let timeout = crate::terminal_host_runtime::CONTROL_RESPONSE_TIMEOUT;
+        let deadline = Instant::now() + timeout;
+        #[cfg(test)]
+        let operation_hook = self.cell_pixel_operation.lock().unwrap().clone();
+        #[cfg(test)]
+        let fanout_operation_hook = operation_hook.clone();
+        let operation_report = report.clone();
+        let operation_completion = completion.clone();
+        let operation_mux = Arc::downgrade(self);
+        let results = bounded_deadline_map(&surfaces, deadline, move |surface, deadline| {
+            let result = apply_cell_pixel_size_until(
+                surface,
+                next,
+                deadline,
+                &operation_report,
+                #[cfg(test)]
+                fanout_operation_hook.as_ref(),
+            );
+            if result.2.is_ok()
+                && let Some(mux) = operation_mux.upgrade()
+            {
+                mux.record_cell_pixel_completion(&operation_completion, surface.id);
+            }
+            result
+        });
         let mut update = CellPixelUpdate::default();
-        for surface in surfaces {
-            let id = surface.id;
-            let size = surface.size();
-            let callback = report.clone();
-            match surface.set_cell_pixel_size_reporting(
-                next.0,
-                next.1,
-                Box::new(move |accepted| callback(id, size, accepted)),
-            ) {
+        let mut retry_surfaces = Vec::new();
+        let mut pending_operations = Vec::new();
+        for (surface, result) in surfaces.iter().zip(results) {
+            let (id, size, result, deferred) = match result {
+                DeadlineMapResult::Complete(result) => result,
+                DeadlineMapResult::Pending(result) => {
+                    pending_operations.push(PendingCellPixelOperation {
+                        surface: Arc::downgrade(surface),
+                        result,
+                    });
+                    update.failures.push(CellPixelUpdateFailure {
+                        surface: surface.id,
+                        error: "cell pixel update is still running after the shared deadline"
+                            .to_string(),
+                        deferred: true,
+                    });
+                    continue;
+                }
+                DeadlineMapResult::Unscheduled => {
+                    retry_surfaces.push(Arc::downgrade(surface));
+                    update.failures.push(CellPixelUpdateFailure {
+                        surface: surface.id,
+                        error: "cell pixel update was deferred because the deadline worker pool \
+                                is saturated"
+                            .to_string(),
+                        deferred: true,
+                    });
+                    continue;
+                }
+            };
+            match result {
                 Ok(Some(reservation_id)) => update.resizes.push((id, size, reservation_id)),
                 Ok(None) => {}
-                Err(error) => update
-                    .failures
-                    .push(CellPixelUpdateFailure { surface: id, error: error.to_string() }),
+                Err(error) => {
+                    let retry = error
+                        .downcast_ref::<
+                            crate::terminal_host_runtime::CellPixelRequestDeadlineElapsed,
+                        >()
+                        .is_some();
+                    if retry {
+                        retry_surfaces.push(Arc::downgrade(surface));
+                    }
+                    update.failures.push(CellPixelUpdateFailure {
+                        surface: id,
+                        error: error.to_string(),
+                        deferred: deferred || retry,
+                    });
+                }
             }
         }
+        let completed = std::mem::take(&mut *completion.completed.lock().unwrap());
+        if !completed.is_empty() {
+            update.failures.retain(|failure| !completed.contains(&failure.surface));
+            retry_surfaces.retain(|surface| {
+                surface.upgrade().is_some_and(|surface| !completed.contains(&surface.id))
+            });
+            pending_operations.retain(|pending| {
+                pending.surface.upgrade().is_some_and(|surface| !completed.contains(&surface.id))
+            });
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.cell_pixel_before_publish.lock().unwrap().clone() {
+            hook(self.cell_pixel_size());
+        }
+        // Keep the published value at the last fully converged metric. New
+        // surfaces use the pending target, and late hosted acknowledgements
+        // remove their exact failure before publishing it globally.
+        if update.failures.is_empty() {
+            *self.cell_pixels.lock().unwrap() = next;
+            *self.pending_cell_pixels.lock().unwrap() = None;
+        } else {
+            *self.pending_cell_pixels.lock().unwrap() = Some(PendingCellPixelUpdate {
+                generation,
+                target: next,
+                failures: update.failures.iter().map(|failure| failure.surface).collect(),
+                use_for_creation: update.failures.iter().all(|failure| failure.deferred),
+            });
+        }
+        completion.publishing.store(false, Ordering::Release);
+        let raced_completions = std::mem::take(&mut *completion.completed.lock().unwrap());
+        for surface in &raced_completions {
+            self.reconcile_cell_pixel_completion_locked(*surface, generation, next);
+        }
+        if !raced_completions.is_empty() {
+            update.failures.retain(|failure| !raced_completions.contains(&failure.surface));
+            retry_surfaces.retain(|surface| {
+                surface.upgrade().is_some_and(|surface| !raced_completions.contains(&surface.id))
+            });
+            pending_operations.retain(|pending| {
+                pending
+                    .surface
+                    .upgrade()
+                    .is_some_and(|surface| !raced_completions.contains(&surface.id))
+            });
+        }
+        let retry_ids = retry_surfaces
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|surface| surface.id)
+            .chain(
+                pending_operations
+                    .iter()
+                    .filter_map(|pending| pending.surface.upgrade())
+                    .map(|surface| surface.id),
+            )
+            .collect::<HashSet<_>>();
+        let retry_spawn = if retry_surfaces.is_empty() && pending_operations.is_empty() {
+            Ok(())
+        } else {
+            self.enqueue_cell_pixel_retries(CellPixelRetryTask {
+                surfaces: retry_surfaces,
+                pending: pending_operations,
+                attempts: 0,
+                generation,
+                target: next,
+                completion,
+                report,
+                timeout,
+                #[cfg(test)]
+                operation_hook,
+            })
+        };
+        if let Err(error) = retry_spawn {
+            for failure in &mut update.failures {
+                if retry_ids.contains(&failure.surface) {
+                    failure.deferred = false;
+                    failure.error = format!("{}; could not schedule retry: {error}", failure.error);
+                }
+            }
+            if let Some(pending) = self.pending_cell_pixels.lock().unwrap().as_mut() {
+                pending.use_for_creation = update.failures.iter().all(|failure| failure.deferred);
+            }
+        }
+        drop(cell_pixel_lifecycle);
         update
     }
 
@@ -5230,6 +6732,7 @@ impl Mux {
         url: String,
         runtime: Arc<BrowserRuntime>,
     ) -> bool {
+        let _cell_pixel_lifecycle = self.cell_pixel_lifecycle.lock().unwrap();
         let (pane_id, size) = {
             let state = self.state.lock().unwrap();
             let Some(pane_id) = state.pane_of(opener_surface) else {
@@ -5241,7 +6744,7 @@ impl Mux {
         let id = self.next_id();
         let opts = self.surface_options.lock().unwrap().clone();
         let size = size.unwrap_or((opts.cols, opts.rows));
-        let cell_pixels = *self.cell_pixels.lock().unwrap();
+        let cell_pixels = self.cell_pixel_creation_size();
         let surface =
             browser::new_surface(id, url.clone(), size, cell_pixels, &opts, Arc::downgrade(self));
         let active_at = self.next_active_at();
@@ -8867,6 +10370,14 @@ mod tests {
         Mux::new_for_test("test", SurfaceOptions::default())
     }
 
+    fn wait_for_kitty_image_budget(mux: &Mux) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !mux.kitty_image_budget_idle_for_test() {
+            assert!(Instant::now() < deadline, "Kitty image budget worker did not converge");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[cfg(unix)]
     fn insert_terminal_identity_surface(
         mux: &Arc<Mux>,
@@ -9032,6 +10543,939 @@ mod tests {
         let unique =
             unique_terminal_match(terminal_id, identities.into_iter().take(1)).unwrap().unwrap();
         assert_eq!(unique.0, 10);
+    }
+
+    #[test]
+    fn cell_pixel_metric_publishes_only_after_existing_surface_fanout() {
+        let mux = test_mux();
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let observed_at_publish = Arc::new(Mutex::new(Vec::new()));
+        *mux.cell_pixel_before_publish.lock().unwrap() = Some(Arc::new({
+            let observed_at_publish = observed_at_publish.clone();
+            move |metric| observed_at_publish.lock().unwrap().push(metric)
+        }));
+
+        let update = mux.set_cell_pixel_size(9, 18);
+
+        assert_eq!(*observed_at_publish.lock().unwrap(), vec![(8, 16)]);
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+        assert_eq!(surface.test_cell_pixel_size(), (9, 18));
+        assert_eq!(update.resizes, vec![(surface.id, (80, 24), 0)]);
+        assert!(update.failures.is_empty());
+    }
+
+    #[test]
+    fn unchanged_cell_pixel_result_must_match_the_requested_metric() {
+        let mux = test_mux();
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+        *mux.cell_pixel_operation.lock().unwrap() = Some(Arc::new(|_, _, _| Ok(None)));
+
+        let update = mux.set_cell_pixel_size(9, 18);
+
+        assert!(update.resizes.is_empty());
+        assert_eq!(update.failures.len(), 1);
+        assert_eq!(update.failures[0].surface, surface.id);
+        assert!(
+            update.failures[0].error.contains("did not converge"),
+            "unexpected failure: {}",
+            update.failures[0].error
+        );
+        assert_eq!(mux.cell_pixel_size(), (8, 16));
+        assert_eq!(surface.test_cell_pixel_size(), (8, 16));
+    }
+
+    #[test]
+    fn terminal_spawn_releases_cell_pixel_lifecycle_and_reconciles_before_publish() {
+        let mux = test_mux();
+        let observed_unlocked = Arc::new(Mutex::new(Vec::new()));
+        *mux.terminal_spawn_after_cell_pixel_snapshot.lock().unwrap() = Some(Arc::new({
+            let mux = Arc::downgrade(&mux);
+            let observed_unlocked = observed_unlocked.clone();
+            move |unlocked| {
+                observed_unlocked.lock().unwrap().push(unlocked);
+                if unlocked {
+                    mux.upgrade().unwrap().set_cell_pixel_size(9, 18);
+                }
+            }
+        }));
+
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+
+        assert_eq!(*observed_unlocked.lock().unwrap(), vec![true]);
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+        assert_eq!(surface.test_cell_pixel_size(), (9, 18));
+    }
+
+    #[test]
+    fn kitty_image_storage_and_copied_pixels_share_one_process_budget() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let mut surfaces = vec![first];
+        for _ in 1..8 {
+            surfaces.push(mux.new_tab(Some(pane), None, Some((80, 24))).unwrap());
+        }
+        wait_for_kitty_image_budget(&mux);
+
+        let configured = surfaces
+            .iter()
+            .map(|surface| {
+                surface
+                    .with_terminal(|terminal| terminal.kitty_image_storage_limit().unwrap())
+                    .unwrap()
+            })
+            .sum::<u64>();
+
+        assert!(
+            configured.saturating_mul(KITTY_IMAGE_PERSISTENT_COPIES_PER_SURFACE + 1)
+                <= KITTY_IMAGE_PROCESS_BUDGET_BYTES,
+            "per-terminal limits allow {} bytes across native screen storage, copied caches, and in-flight uploads",
+            configured.saturating_mul(KITTY_IMAGE_PERSISTENT_COPIES_PER_SURFACE + 1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_terminal_placeholders_do_not_consume_kitty_quota() {
+        let mux = test_mux();
+        let opts = mux.surface_options.lock().unwrap().clone();
+        let live =
+            Surface::spawn_for_test(mux.next_id(), opts.clone(), Arc::downgrade(&mux)).unwrap();
+        wait_for_kitty_image_budget(&mux);
+        let unconstrained =
+            live.with_terminal(|terminal| terminal.kitty_graphics_limits().unwrap()).unwrap();
+
+        let placeholder = Surface::exited_terminal_placeholder(
+            mux.next_id(),
+            opts,
+            Arc::downgrade(&mux),
+            TerminalHostIdentity {
+                terminal_id: "00112233445566778899aabbccddeeff".into(),
+                incarnation: "11111111111111111111111111111111".into(),
+            },
+        )
+        .unwrap();
+        wait_for_kitty_image_budget(&mux);
+
+        assert_eq!(
+            live.with_terminal(|terminal| terminal.kitty_graphics_limits().unwrap()).unwrap(),
+            unconstrained,
+            "an exited placeholder reduced a live terminal's graphics share"
+        );
+        assert_eq!(
+            placeholder
+                .with_terminal(|terminal| terminal.kitty_graphics_limits().unwrap())
+                .unwrap(),
+            KittyGraphicsLimits::disabled(),
+            "an exited placeholder retained graphics resources it cannot use"
+        );
+    }
+
+    #[test]
+    fn kitty_object_limits_cover_primary_and_alternate_screens() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let mut surfaces = vec![first];
+        for _ in 1..8 {
+            surfaces.push(mux.new_tab(Some(pane), None, Some((80, 24))).unwrap());
+        }
+        wait_for_kitty_image_budget(&mux);
+        let (configured_images, configured_placements) = surfaces
+            .iter()
+            .map(|surface| {
+                surface
+                    .with_terminal(|terminal| {
+                        let primary_images = terminal.kitty_image_count_limit().unwrap();
+                        let primary_placements = terminal.kitty_placement_count_limit().unwrap();
+                        terminal.vt_write(b"\x1b[?1049h");
+                        let alternate_images = terminal.kitty_image_count_limit().unwrap();
+                        let alternate_placements = terminal.kitty_placement_count_limit().unwrap();
+                        terminal.vt_write(b"\x1b[?1049l");
+                        (
+                            primary_images.saturating_add(alternate_images),
+                            primary_placements.saturating_add(alternate_placements),
+                        )
+                    })
+                    .unwrap()
+            })
+            .fold((0u64, 0u64), |(images, placements), candidate| {
+                (images.saturating_add(candidate.0), placements.saturating_add(candidate.1))
+            });
+        assert!(
+            configured_images <= 4_096,
+            "primary and alternate screens allow {configured_images} native image records process-wide"
+        );
+        assert!(
+            configured_placements <= 16_384,
+            "primary and alternate screens allow {configured_placements} native placements process-wide"
+        );
+    }
+
+    #[test]
+    fn kitty_inflight_uploads_share_the_process_byte_budget() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let mut surfaces = vec![first];
+        for _ in 1..8 {
+            surfaces.push(mux.new_tab(Some(pane), None, Some((80, 24))).unwrap());
+        }
+        wait_for_kitty_image_budget(&mux);
+        let per_surface_limit = surfaces[0]
+            .with_terminal(|terminal| terminal.kitty_image_storage_limit().unwrap())
+            .unwrap() as usize;
+        let segment_bytes = (per_surface_limit.saturating_mul(3) / 5) / 4 * 4;
+        let first =
+            format!("\x1b_Ga=t,t=d,f=24,i=991,s=1,v=1,m=1,q=2;{}\x1b\\", "A".repeat(segment_bytes));
+        let second = format!("\x1b_Ga=t,t=d,f=24,i=991,m=1,q=2;{}", "A".repeat(segment_bytes));
+        let inflight_is_bounded = surfaces[0]
+            .with_terminal(|terminal| {
+                terminal.vt_write(first.as_bytes());
+                terminal.vt_write(second.as_bytes());
+                terminal.preflight_vt_replay_bounded(crate::surface::VT_REPLAY_MAX_BYTES).is_err()
+            })
+            .unwrap();
+        assert!(
+            inflight_is_bounded,
+            "completed and current Kitty upload chunks retained more than one surface byte share"
+        );
+    }
+
+    #[test]
+    fn closing_kitty_surfaces_rebalances_the_survivors_process_share() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let mut surfaces = vec![first.clone()];
+        for _ in 1..8 {
+            surfaces.push(mux.new_tab(Some(pane), None, Some((80, 24))).unwrap());
+        }
+        wait_for_kitty_image_budget(&mux);
+        let constrained = first
+            .with_terminal(|terminal| {
+                (
+                    terminal.kitty_image_storage_limit().unwrap(),
+                    terminal.kitty_image_count_limit().unwrap(),
+                    terminal.kitty_placement_count_limit().unwrap(),
+                )
+            })
+            .unwrap();
+
+        for surface in surfaces.iter().skip(1) {
+            assert!(mux.close_surface(surface.id).unwrap());
+        }
+        wait_for_kitty_image_budget(&mux);
+
+        let survivor_limit = first
+            .with_terminal(|terminal| {
+                (
+                    terminal.kitty_image_storage_limit().unwrap(),
+                    terminal.kitty_image_count_limit().unwrap(),
+                    terminal.kitty_placement_count_limit().unwrap(),
+                )
+            })
+            .unwrap();
+        let expected = KITTY_IMAGE_PROCESS_BUDGET_BYTES
+            .checked_div(KITTY_IMAGE_PERSISTENT_COPIES_PER_SURFACE + 1)
+            .unwrap()
+            .min(ghostty_vt::MAX_KITTY_IMAGE_BYTES as u64);
+        assert!(
+            survivor_limit.0 > constrained.0,
+            "surviving terminal kept its peak-surface quota of {} bytes",
+            survivor_limit.0
+        );
+        assert_eq!(survivor_limit.0, expected);
+        assert!(
+            survivor_limit.1 > constrained.1,
+            "surviving terminal kept its peak-surface image count of {}",
+            survivor_limit.1
+        );
+        assert!(
+            survivor_limit.2 > constrained.2,
+            "surviving terminal kept its peak-surface placement count of {}",
+            survivor_limit.2
+        );
+        assert_eq!(survivor_limit.1, 2_048);
+        assert_eq!(survivor_limit.2, 8_192);
+    }
+
+    #[test]
+    fn kitty_quota_updates_delay_terminal_creation_until_startup_is_safe() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        *mux.kitty_image_budget_operation.lock().unwrap() = Some(Arc::new({
+            let gate = gate.clone();
+            move |surface, limits, _deadline| {
+                if surface.id == first.id {
+                    let (released, changed) = &*gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = changed.wait(released).unwrap();
+                    }
+                }
+                surface.set_kitty_graphics_limits(
+                    limits.image_bytes,
+                    limits.inflight_bytes,
+                    limits.images,
+                    limits.placements,
+                )
+            }
+        }));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let creating_mux = mux.clone();
+        let creator = std::thread::spawn(move || {
+            let result = creating_mux.new_tab(Some(pane), None, Some((80, 24)));
+            let _ = sender.send(result);
+        });
+
+        let created_without_waiting = receiver.recv_timeout(Duration::from_millis(250)).ok();
+        let returned_before_release = created_without_waiting.is_some();
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        let surface = match created_without_waiting {
+            Some(result) => result.unwrap(),
+            None => receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(),
+        };
+        creator.join().unwrap();
+        *mux.kitty_image_budget_operation.lock().unwrap() = None;
+        wait_for_kitty_image_budget(&mux);
+
+        assert!(
+            !returned_before_release,
+            "terminal creation bypassed the in-flight Kitty quota shrink"
+        );
+        assert!(mux.close_surface(surface.id).unwrap());
+    }
+
+    #[test]
+    fn kitty_quota_restoration_uses_linear_bucket_updates() {
+        let mux = test_mux();
+        let applications = Arc::new(AtomicUsize::new(0));
+        *mux.kitty_image_budget_operation.lock().unwrap() = Some(Arc::new({
+            let applications = applications.clone();
+            move |surface, limits, _deadline| {
+                applications.fetch_add(1, Ordering::AcqRel);
+                surface.set_kitty_graphics_limits(
+                    limits.image_bytes,
+                    limits.inflight_bytes,
+                    limits.images,
+                    limits.placements,
+                )
+            }
+        }));
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let mut surfaces = vec![first];
+        for _ in 1..16 {
+            surfaces.push(mux.new_tab(Some(pane), None, Some((80, 24))).unwrap());
+        }
+
+        wait_for_kitty_image_budget(&mux);
+
+        let applied = applications.load(Ordering::Acquire);
+        assert!(
+            applied <= surfaces.len() * 4,
+            "restoring {} terminals applied {applied} Kitty quota updates",
+            surfaces.len()
+        );
+    }
+
+    #[test]
+    fn kitty_quota_expansion_delays_concurrent_terminal_until_reshrink() {
+        let mux = test_mux();
+        let survivor = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(survivor.id).unwrap());
+        let mut surfaces = vec![survivor.clone()];
+        for _ in 1..8 {
+            surfaces.push(mux.new_tab(Some(pane), None, Some((80, 24))).unwrap());
+        }
+        wait_for_kitty_image_budget(&mux);
+
+        let expansion = kitty_image_limits_for_capacity(1);
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+        *mux.kitty_image_budget_operation.lock().unwrap() = Some(Arc::new({
+            let gate = gate.clone();
+            let survivor_id = survivor.id;
+            move |surface, limits, _deadline| {
+                if surface.id == survivor_id && limits == expansion {
+                    let _ = started_sender.try_send(());
+                    let (released, changed) = &*gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = changed.wait(released).unwrap();
+                    }
+                }
+                surface.set_kitty_graphics_limits(
+                    limits.image_bytes,
+                    limits.inflight_bytes,
+                    limits.images,
+                    limits.placements,
+                )
+            }
+        }));
+        for surface in surfaces.iter().skip(1) {
+            assert!(mux.close_surface(surface.id).unwrap());
+        }
+        started_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let creating_mux = mux.clone();
+        let creator = std::thread::spawn(move || {
+            let _ = sender.send(creating_mux.new_tab(Some(pane), None, Some((80, 24))));
+        });
+        let returned_before_release = receiver.recv_timeout(Duration::from_millis(250)).ok();
+        assert!(
+            returned_before_release.is_none(),
+            "terminal creation bypassed a stale expansion and consumed output without safe quota"
+        );
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        let concurrent = receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        creator.join().unwrap();
+        wait_for_kitty_image_budget(&mux);
+        *mux.kitty_image_budget_operation.lock().unwrap() = None;
+        let settled = kitty_image_limits_for_capacity(2).image_bytes;
+        for surface in [&survivor, &concurrent] {
+            assert_eq!(
+                surface
+                    .with_terminal(|terminal| terminal.kitty_image_storage_limit().unwrap())
+                    .unwrap(),
+                settled
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_creation_never_exposes_a_disabled_kitty_quota() {
+        let mux = test_mux();
+        let survivor = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(survivor.id).unwrap());
+        let mut surfaces = vec![survivor.clone()];
+        for _ in 1..8 {
+            surfaces.push(mux.new_tab(Some(pane), None, Some((80, 24))).unwrap());
+        }
+        wait_for_kitty_image_budget(&mux);
+
+        let expansion = kitty_image_limits_for_capacity(1);
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+        *mux.kitty_image_budget_operation.lock().unwrap() = Some(Arc::new({
+            let gate = gate.clone();
+            let survivor_id = survivor.id;
+            move |surface, limits, _deadline| {
+                if surface.id == survivor_id && limits == expansion {
+                    let _ = started_sender.try_send(());
+                    let (released, changed) = &*gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = changed.wait(released).unwrap();
+                    }
+                }
+                surface.set_kitty_graphics_limits(
+                    limits.image_bytes,
+                    limits.inflight_bytes,
+                    limits.images,
+                    limits.placements,
+                )
+            }
+        }));
+        for surface in surfaces.iter().skip(1) {
+            assert!(mux.close_surface(surface.id).unwrap());
+        }
+        started_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let creating_mux = mux.clone();
+        let creator = std::thread::spawn(move || {
+            let _ = sender.send(creating_mux.new_tab(Some(pane), None, Some((80, 24))));
+        });
+        let created_before_rebalance = receiver.recv_timeout(Duration::from_millis(250)).ok();
+        let startup_limit = created_before_rebalance.as_ref().map(|result| {
+            result
+                .as_ref()
+                .unwrap()
+                .with_terminal(|terminal| terminal.kitty_image_storage_limit().unwrap())
+                .unwrap()
+        });
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        let concurrent = match created_before_rebalance {
+            Some(result) => result.unwrap(),
+            None => receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(),
+        };
+        creator.join().unwrap();
+        *mux.kitty_image_budget_operation.lock().unwrap() = None;
+        wait_for_kitty_image_budget(&mux);
+
+        let initial_limit = startup_limit.unwrap_or_else(|| {
+            concurrent
+                .with_terminal(|terminal| terminal.kitty_image_storage_limit().unwrap())
+                .unwrap()
+        });
+        assert!(
+            initial_limit > 0,
+            "a newly launched terminal could consume startup output while Kitty graphics were disabled"
+        );
+    }
+
+    #[test]
+    fn kitty_quota_exhaustion_disables_only_overflow_surfaces_and_promotes_them() {
+        let mux = test_mux();
+        let opts = mux.surface_options.lock().unwrap().clone();
+        let owner_limit =
+            usize::try_from(KITTY_IMAGE_PROCESS_BUDGET_COUNT / KITTY_OBJECT_OWNERS_PER_SURFACE)
+                .unwrap();
+        assert_eq!(owner_limit, 2_048);
+        let mut surfaces = Vec::with_capacity(owner_limit + 1);
+        for _ in 0..=owner_limit {
+            surfaces.push(
+                Surface::spawn_for_test(mux.next_id(), opts.clone(), Arc::downgrade(&mux)).unwrap(),
+            );
+        }
+        wait_for_kitty_image_budget(&mux);
+
+        let participating_limit = surfaces[0]
+            .with_terminal(|terminal| terminal.kitty_image_count_limit().unwrap())
+            .unwrap();
+        assert!(participating_limit > 0);
+        assert_eq!(
+            surfaces[owner_limit]
+                .with_terminal(|terminal| terminal.kitty_image_count_limit().unwrap())
+                .unwrap(),
+            0,
+            "quota exhaustion disabled terminals that already owned a graphics share"
+        );
+
+        mux.unregister_kitty_image_surface(&surfaces[0]).unwrap();
+        wait_for_kitty_image_budget(&mux);
+        assert_eq!(
+            surfaces[owner_limit]
+                .with_terminal(|terminal| terminal.kitty_image_count_limit().unwrap())
+                .unwrap(),
+            participating_limit,
+            "an overflow terminal was not promoted when a graphics share became available"
+        );
+    }
+
+    #[test]
+    fn kitty_quota_worker_retries_a_transient_update_failure() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let second = mux.new_tab(Some(pane), None, Some((80, 24))).unwrap();
+        wait_for_kitty_image_budget(&mux);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        *mux.kitty_image_budget_operation.lock().unwrap() = Some(Arc::new({
+            let attempts = attempts.clone();
+            move |surface, limits, _deadline| {
+                if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                    anyhow::bail!("injected transient Kitty quota failure");
+                }
+                surface.set_kitty_graphics_limits(
+                    limits.image_bytes,
+                    limits.inflight_bytes,
+                    limits.images,
+                    limits.placements,
+                )
+            }
+        }));
+
+        assert!(mux.close_surface(second.id).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while attempts.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            attempts.load(Ordering::Acquire) >= 2,
+            "Kitty quota worker stopped after a transient failure"
+        );
+        wait_for_kitty_image_budget(&mux);
+    }
+
+    #[test]
+    fn kitty_quota_worker_stops_after_persistent_update_failure() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let second = mux.new_tab(Some(pane), None, Some((80, 24))).unwrap();
+        wait_for_kitty_image_budget(&mux);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        *mux.kitty_image_budget_operation.lock().unwrap() = Some(Arc::new({
+            let attempts = attempts.clone();
+            move |_surface, _limits, _deadline| {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                anyhow::bail!("injected persistent Kitty quota failure")
+            }
+        }));
+
+        assert!(mux.close_surface(second.id).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while mux.kitty_image_budget.lock().unwrap().worker_running && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            !mux.kitty_image_budget.lock().unwrap().worker_running,
+            "Kitty quota worker retried a permanent failure forever"
+        );
+        assert!(
+            attempts.load(Ordering::Acquire) <= 4,
+            "Kitty quota worker exceeded its retry budget"
+        );
+
+        let started = Instant::now();
+        let error = mux
+            .new_tab(Some(pane), None, Some((80, 24)))
+            .expect_err("a blocked Kitty quota transition admitted another terminal");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a blocked Kitty quota transition waited for the control timeout: {error}"
+        );
+    }
+
+    #[test]
+    fn kitty_quota_worker_stops_waiting_for_an_operation_that_ignores_its_deadline() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        let second = mux.new_tab(Some(pane), None, Some((80, 24))).unwrap();
+        wait_for_kitty_image_budget(&mux);
+
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = std::sync::mpsc::sync_channel(1);
+        *mux.kitty_image_budget_operation.lock().unwrap() = Some(Arc::new({
+            let gate = gate.clone();
+            move |_surface, _limits, _deadline| {
+                let _ = started_sender.try_send(());
+                let (released, changed) = &*gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+                let _ = finished_sender.try_send(());
+                anyhow::bail!("released persistent Kitty quota operation")
+            }
+        }));
+
+        assert!(mux.close_surface(second.id).unwrap());
+        started_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while mux.kitty_image_budget.lock().unwrap().worker_running && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stopped = !mux.kitty_image_budget.lock().unwrap().worker_running;
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        finished_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(stopped, "Kitty quota worker waited forever for an operation past its deadline");
+    }
+
+    #[test]
+    fn cell_pixel_fanout_runs_concurrently_with_one_shared_deadline() {
+        let items = (0..8).collect::<Vec<_>>();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let operation_active = active;
+        let operation_max_active = max_active.clone();
+
+        let results = bounded_deadline_map(&items, deadline, move |item, observed_deadline| {
+            assert_eq!(observed_deadline, deadline);
+            let concurrent = operation_active.fetch_add(1, Ordering::AcqRel) + 1;
+            operation_max_active.fetch_max(concurrent, Ordering::AcqRel);
+            std::thread::sleep(Duration::from_millis(10));
+            operation_active.fetch_sub(1, Ordering::AcqRel);
+            item * 2
+        });
+
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|result| match result {
+                    DeadlineMapResult::Complete(result) => Some(result),
+                    DeadlineMapResult::Pending(_) | DeadlineMapResult::Unscheduled => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .unwrap(),
+            vec![0, 2, 4, 6, 8, 10, 12, 14]
+        );
+        assert!(max_active.load(Ordering::Acquire) > 1);
+    }
+
+    #[test]
+    fn cell_pixel_fanout_returns_when_an_operation_ignores_its_deadline() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let caller_gate = gate.clone();
+        let caller = std::thread::spawn(move || {
+            let items = vec![1_u8];
+            let deadline = Instant::now() + Duration::from_millis(30);
+            let results = bounded_deadline_map(&items, deadline, move |item, _| {
+                let (released, changed) = &*caller_gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+                *item
+            });
+            let _ = sender.send(results);
+        });
+
+        let returned_before_release = receiver.recv_timeout(Duration::from_millis(150)).is_ok();
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        caller.join().unwrap();
+
+        assert!(
+            returned_before_release,
+            "fanout joined an operation after its shared deadline elapsed"
+        );
+    }
+
+    #[test]
+    fn timed_out_cell_pixel_failure_is_retried_after_the_worker_finishes() {
+        let mux = test_mux();
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        *mux.cell_pixel_fanout_timeout.lock().unwrap() = Some(Duration::from_millis(20));
+        *mux.cell_pixel_operation.lock().unwrap() = Some(Arc::new({
+            let attempts = attempts.clone();
+            move |surface, target, _deadline| {
+                if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                    std::thread::sleep(Duration::from_millis(60));
+                    anyhow::bail!("injected late cell-pixel failure");
+                }
+                surface.set_cell_pixel_size(target.0, target.1).map(|changed| changed.then_some(0))
+            }
+        }));
+
+        let update = mux.set_cell_pixel_size(9, 18);
+        assert_eq!(update.failures.len(), 1);
+        assert!(update.failures[0].deferred);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while mux.cell_pixel_size() != (9, 18) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            attempts.load(Ordering::Acquire) >= 2,
+            "the failed operation that finished after the shared deadline was never retried"
+        );
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+        assert_eq!(surface.test_cell_pixel_size(), (9, 18));
+    }
+
+    #[test]
+    fn cell_pixel_fanout_retries_the_same_metric_before_publishing_it() {
+        let mux = test_mux();
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+        surface.fail_next_test_master_resize();
+
+        let update = mux.set_cell_pixel_size(9, 18);
+
+        assert!(update.resizes.is_empty());
+        assert_eq!(update.failures.len(), 1);
+        assert_eq!(update.failures[0].surface, surface.id);
+        assert!(update.failures[0].error.contains("injected PTY master resize failure"));
+        assert_eq!(
+            mux.cell_pixel_size(),
+            (8, 16),
+            "published metric must remain at the last fully converged value"
+        );
+        assert_eq!(mux.cell_pixel_creation_size(), (8, 16));
+        assert_eq!(surface.test_cell_pixel_size(), (8, 16));
+        let created_while_pending = mux.new_workspace(None, Some((80, 24))).unwrap();
+        assert_eq!(created_while_pending.test_cell_pixel_size(), (8, 16));
+        let master = surface.test_master_size();
+        assert_eq!(
+            (master.cols, master.rows, master.pixel_width, master.pixel_height),
+            (80, 24, 640, 384)
+        );
+
+        let retried = mux.set_cell_pixel_size(9, 18);
+        assert!(retried.failures.is_empty());
+        assert_eq!(
+            retried.resizes,
+            vec![(surface.id, (80, 24), 0), (created_while_pending.id, (80, 24), 0)]
+        );
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+        assert_eq!(surface.test_cell_pixel_size(), (9, 18));
+    }
+
+    #[test]
+    fn cell_pixel_fanout_retries_work_skipped_after_the_shared_deadline() {
+        let mux = test_mux();
+        let first = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let pane = mux.with_state(|state| state.pane_of(first.id).unwrap());
+        for _ in 1..=CELL_PIXEL_FANOUT_MAX_WORKERS {
+            mux.new_tab(Some(pane), None, Some((80, 24))).unwrap();
+        }
+        let mut surface_ids =
+            mux.state.lock().unwrap().surfaces.keys().copied().collect::<Vec<_>>();
+        surface_ids.sort_unstable();
+        assert_eq!(surface_ids.len(), CELL_PIXEL_FANOUT_MAX_WORKERS + 1);
+        let last_surface = *surface_ids.last().unwrap();
+        let last_attempts = Arc::new(AtomicUsize::new(0));
+        *mux.cell_pixel_fanout_timeout.lock().unwrap() = Some(Duration::from_millis(50));
+        *mux.cell_pixel_operation.lock().unwrap() = Some(Arc::new({
+            let last_attempts = last_attempts.clone();
+            move |surface, target, deadline| {
+                if surface.id != last_surface {
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(10),
+                    );
+                } else {
+                    last_attempts.fetch_add(1, Ordering::AcqRel);
+                    if Instant::now() >= deadline {
+                        return Err(
+                            crate::terminal_host_runtime::CellPixelRequestDeadlineElapsed.into()
+                        );
+                    }
+                }
+                surface.set_cell_pixel_size(target.0, target.1).map(|changed| changed.then_some(0))
+            }
+        }));
+
+        let update = mux.set_cell_pixel_size(9, 18);
+
+        assert_eq!(update.failures.len(), surface_ids.len());
+        assert!(update.failures.iter().all(|failure| failure.deferred));
+        let retry_deadline = Instant::now() + Duration::from_secs(1);
+        while mux.cell_pixel_size() != (9, 18) && Instant::now() < retry_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            mux.cell_pixel_size(),
+            (9, 18),
+            "work that missed the first worker wave was never reconciled"
+        );
+        assert!(mux.pending_cell_pixels.lock().unwrap().is_none());
+        assert_eq!(last_attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cell_pixel_deadline_retries_stop_and_report_terminal_failure() {
+        let mux = test_mux();
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        *mux.cell_pixel_fanout_timeout.lock().unwrap() = Some(Duration::from_millis(10));
+        *mux.cell_pixel_operation.lock().unwrap() = Some(Arc::new({
+            let attempts = attempts.clone();
+            move |_, _, _| {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Err(crate::terminal_host_runtime::CellPixelRequestDeadlineElapsed.into())
+            }
+        }));
+        let events = mux.subscribe();
+
+        let update = mux.set_cell_pixel_size(9, 18);
+
+        assert_eq!(update.failures.len(), 1);
+        assert!(update.failures[0].deferred);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while mux.cell_pixel_retries.lock().unwrap().worker_running && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !mux.cell_pixel_retries.lock().unwrap().worker_running,
+            "deadline retries did not stop after {} attempts",
+            attempts.load(Ordering::Acquire)
+        );
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            usize::from(CELL_PIXEL_RETRY_MAX_ATTEMPTS) + 1
+        );
+        assert_eq!(mux.cell_pixel_creation_size(), (8, 16));
+        assert!(events.try_iter().any(|event| {
+            matches!(event, MuxEvent::Status(message)
+                if message.contains("cell pixel update stopped after"))
+        }));
+
+        assert!(surface.set_cell_pixel_size(9, 18).unwrap());
+        mux.reconcile_deferred_cell_pixel_ack(surface.id, (9, 18));
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+        assert!(mux.pending_cell_pixels.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn late_cell_pixel_ack_publishes_the_pending_creation_metric() {
+        let mux = test_mux();
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+        surface.fail_next_test_master_resize();
+
+        let update = mux.set_cell_pixel_size(9, 18);
+        assert_eq!(update.failures.len(), 1);
+        assert_eq!(mux.cell_pixel_size(), (8, 16));
+        assert_eq!(mux.cell_pixel_creation_size(), (8, 16));
+
+        assert!(surface.set_cell_pixel_size(9, 18).unwrap());
+        mux.reconcile_deferred_cell_pixel_ack(surface.id, (9, 18));
+
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+        assert_eq!(mux.cell_pixel_creation_size(), (9, 18));
+        assert!(mux.pending_cell_pixels.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn deferred_cell_pixel_target_sizes_new_surfaces_before_the_ack_arrives() {
+        let mux = test_mux();
+        let pending_surface = 99_999;
+        *mux.pending_cell_pixels.lock().unwrap() = Some(PendingCellPixelUpdate {
+            generation: 1,
+            target: (9, 18),
+            failures: HashSet::from([pending_surface]),
+            use_for_creation: true,
+        });
+
+        let created = mux.new_workspace(None, Some((80, 24))).unwrap();
+
+        assert_eq!(mux.cell_pixel_size(), (8, 16));
+        assert_eq!(created.test_cell_pixel_size(), (9, 18));
+        mux.reconcile_deferred_cell_pixel_ack(pending_surface, (9, 18));
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+    }
+
+    #[test]
+    fn closing_the_last_failed_surface_publishes_pending_cell_pixels() {
+        let mux = test_mux();
+        let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
+        *mux.pending_cell_pixels.lock().unwrap() = Some(PendingCellPixelUpdate {
+            generation: 1,
+            target: (9, 18),
+            failures: HashSet::from([surface.id]),
+            use_for_creation: false,
+        });
+
+        assert_eq!(mux.cell_pixel_size(), (8, 16));
+        assert!(mux.close_surface(surface.id).unwrap());
+
+        assert_eq!(mux.cell_pixel_size(), (9, 18));
+        assert!(mux.pending_cell_pixels.lock().unwrap().is_none());
     }
 
     #[test]
@@ -9314,14 +11758,16 @@ mod tests {
     }
 
     #[test]
-    fn client_sizes_clamp_to_tmux_window_bounds() {
+    fn client_sizes_clamp_before_backend_rejects_unrepresentable_pixels() {
         let mux = test_mux();
         let surface = mux.new_workspace(None, None).unwrap();
 
-        mux.resize_surface_for_client(surface.id, 1, 0, u16::MAX).unwrap();
+        assert_eq!(clamp_terminal_size(0, u16::MAX), (1, 10_000));
+        let error = mux.resize_surface_for_client(surface.id, 1, 0, u16::MAX).unwrap_err();
 
-        assert_eq!(mux.client_surface_size(surface.id, 1), Some((1, 10_000)));
-        assert_eq!(surface.size(), (1, 10_000));
+        assert!(error.to_string().contains("PTY pixel height exceeds 65535"));
+        assert_eq!(mux.client_surface_size(surface.id, 1), None);
+        assert_eq!(surface.size(), (80, 24));
     }
 
     #[test]
@@ -12861,7 +15307,7 @@ mod tests {
         .unwrap();
         let surface = insert_terminal_identity_surface(&mux, TERMINAL, INCARNATION, &first.key);
 
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -13154,7 +15600,7 @@ mod tests {
     fn concurrent_empty_workspace_terminal_inherits_the_first_terminals_cwd() {
         let mux = test_mux();
         let workspace = mux.create_empty_workspace(Some("shared".into()), None, None).unwrap();
-        let empty_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let empty_checks = Arc::new(AtomicUsize::new(0));
         let (second_checked_tx, second_checked_rx) = std::sync::mpsc::sync_channel(1);
         *mux.terminal_create_after_empty_check.lock().unwrap() = Some(Arc::new({
             move || {

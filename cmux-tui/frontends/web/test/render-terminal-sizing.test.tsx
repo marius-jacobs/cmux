@@ -2,6 +2,7 @@ import { render, waitFor } from "@testing-library/react";
 import { useCallback } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CmuxClient, RenderAttachEvent, RenderCursor } from "cmux/browser";
+import { RenderGraphicsBudgetProvider } from "../src/components/RenderGraphics";
 import { useRenderTerminal } from "../src/hooks/useRenderTerminal";
 
 let recoveryDelay = 60_000;
@@ -15,21 +16,38 @@ let hostWidth = 800;
 
 class TestStream {
   private index = 0;
-  readonly close = vi.fn();
+  private wake: ((event: RenderAttachEvent) => void) | null = null;
+  readonly close = vi.fn(() => {
+    this.wake?.({ event: "detached", surface: 7 });
+    this.wake = null;
+  });
 
   constructor(private readonly events: RenderAttachEvent[]) {}
 
   async next(): Promise<RenderAttachEvent> {
     const event = this.events[this.index++];
     if (event !== undefined) return event;
-    return await new Promise<RenderAttachEvent>(() => {});
+    return await new Promise<RenderAttachEvent>((resolve) => {
+      this.wake = resolve;
+    });
+  }
+
+  get delivered(): number {
+    return Math.min(this.index, this.events.length);
   }
 }
 
-function Harness({ client }: { client: CmuxClient }) {
-  const onError = useCallback((error: Error) => {
+function Harness({
+  client,
+  onError: suppliedOnError,
+}: {
+  client: CmuxClient;
+  onError?: (error: Error) => void;
+}) {
+  const throwingOnError = useCallback((error: Error) => {
     throw error;
   }, []);
+  const onError = suppliedOnError ?? throwingOnError;
   const { terminalRef } = useRenderTerminal({ client, surface: 7, active: true, onError });
   const hostRef = useCallback((node: HTMLDivElement | null) => {
     if (node !== null) {
@@ -129,6 +147,77 @@ describe("render terminal sizing", () => {
     expect(client.releaseSurfaceSize).toHaveBeenCalledWith(7);
   }, 20_000);
 
+  it("reattaches for an authoritative snapshot when shared graphics capacity returns", async () => {
+    globalThis.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    const cursor: RenderCursor = {
+      x: 0,
+      y: 0,
+      style: "bar",
+      blink: true,
+      visible: true,
+      color: null,
+    };
+    const data = `${"A".repeat(13_333_334)}==`;
+    const state: RenderAttachEvent = {
+      event: "render-state",
+      surface: 7,
+      size: { cols: 100, rows: 30 },
+      cursor,
+      default_fg: "#f8f8f2",
+      default_bg: "#272822",
+      scrollback_rows: 0,
+      rows: [],
+      graphics: {
+        generation: 1,
+        images: [{
+          id: 1,
+          generation: 1,
+          width: 2_500_000,
+          height: 1,
+          format: "rgba",
+          data,
+        }],
+        placements: [],
+      },
+    };
+    const initialStreams = Array.from({ length: 6 }, () => new TestStream([state]));
+    const streamQueues = initialStreams.map((stream, index) =>
+      index === initialStreams.length - 1
+        ? [stream, new TestStream([state])]
+        : [stream]
+    );
+    const clients = streamQueues.map((streams) => ({
+      attachSurface: vi.fn(async () => streams.shift()!),
+      resizeSurface: vi.fn(async () => ({ accepted: true, reservation_id: null })),
+      releaseSurfaceSize: vi.fn(async () => ({})),
+    } as unknown as CmuxClient));
+    const renderHarnesses = (visible: readonly CmuxClient[]) => (
+      <RenderGraphicsBudgetProvider>
+        {visible.map((client, index) => (
+          <Harness key={clients.indexOf(client)} client={client} />
+        ))}
+      </RenderGraphicsBudgetProvider>
+    );
+
+    const view = render(renderHarnesses(clients));
+    await waitFor(() => {
+      expect(initialStreams.every((stream) => stream.delivered === 1)).toBe(true);
+    });
+    expect(clients.at(-1)!.attachSurface).toHaveBeenCalledTimes(1);
+
+    view.rerender(renderHarnesses(clients.slice(1)));
+
+    await waitFor(
+      () => expect(clients.at(-1)!.attachSurface).toHaveBeenCalledTimes(2),
+      { timeout: 1_000 },
+    );
+    view.unmount();
+  });
+
   it("does not publish a viewer resize while the attachment is disconnected", async () => {
     let resizeCallback: ResizeObserverCallback | null = null;
     globalThis.ResizeObserver = class {
@@ -194,5 +283,57 @@ describe("render terminal sizing", () => {
     render(<Harness client={client} />);
 
     await waitFor(() => expect(client.releaseSurfaceSize).toHaveBeenCalledWith(7));
+  });
+
+  it("closes the render stream when authoritative Kitty image state exceeds its cap", async () => {
+    globalThis.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    const cursor: RenderCursor = {
+      x: 0,
+      y: 0,
+      style: "bar",
+      blink: true,
+      visible: true,
+      color: null,
+    };
+    const stream = new TestStream([{
+      event: "render-state",
+      surface: 7,
+      size: { cols: 100, rows: 30 },
+      cursor,
+      default_fg: "#f8f8f2",
+      default_bg: "#272822",
+      scrollback_rows: 0,
+      rows: [],
+      graphics: {
+        generation: 1,
+        images: Array.from({ length: 4_097 }, (_, id) => ({
+          id,
+          generation: 1,
+          width: 1,
+          height: 1,
+          format: "rgb" as const,
+          data: "AAAA",
+        })),
+        placements: [],
+      },
+    }]);
+    const client = {
+      attachSurface: vi.fn(async () => stream),
+      resizeSurface: vi.fn(async () => ({ accepted: true, reservation_id: null })),
+      releaseSurfaceSize: vi.fn(async () => ({})),
+    } as unknown as CmuxClient;
+    const onError = vi.fn();
+
+    render(<Harness client={client} onError={onError} />);
+
+    await waitFor(() => expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "render graphics state exceeds 4096 images" }),
+    ));
+    expect(stream.close).toHaveBeenCalledTimes(1);
+    expect(client.releaseSurfaceSize).toHaveBeenCalledWith(7);
   });
 });

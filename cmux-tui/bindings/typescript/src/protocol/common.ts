@@ -22,6 +22,25 @@ export interface Size {
   rows: number;
 }
 
+/** One Kitty image-number alias required to restore a byte-stream VT replay. */
+export interface KittyImageAlias {
+  image_id: number;
+  image_number: number;
+}
+
+/** Protocol-v10 Kitty state that VT escape sequences cannot represent. */
+export interface KittyGraphicsState {
+  image_bytes: number;
+  inflight_bytes: number;
+  images: number;
+  placements: number;
+  replay_cursor_offset: number;
+  primary_replay_next_image_id: number;
+  primary_next_image_id: number;
+  alternate_replay_next_image_id: number;
+  alternate_next_image_id: number;
+}
+
 /** The canonical empty command result. */
 export type EmptyResult = Record<string, never>;
 
